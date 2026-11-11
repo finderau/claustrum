@@ -141,13 +141,13 @@ run "POST /v1/propose_topic (expect 200, count=1, not promotable)" \
 run "POST /v1/checkin test-2 (kev, same repo)" \
   -X POST "http://localhost:${PORT_API}/v1/checkin" \
   -H 'Content-Type: application/json' \
-  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -H 'X-Claustrum-User-Email: bob@finder.com' \
   -d '{"uid":"test-2","machine":"kev-mbp","label":"dedup-probe","repo":"joewaller/claustrum","branch":"feat/v2-dedup-core"}'
 
 run "POST /v1/update test-2 (touches the SAME file as test-1 — t1 overlap)" \
   -X POST "http://localhost:${PORT_API}/v1/update" \
   -H 'Content-Type: application/json' \
-  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -H 'X-Claustrum-User-Email: bob@finder.com' \
   -d '{"uid":"test-2","files_touched":["cloud/server/app/routes/list_peers.py"],"working_on":"also poking list_peers"}'
 
 run "GET /v1/list for test-1 (expect test-2 in t1_file_overlap)" \
@@ -157,7 +157,7 @@ run "GET /v1/list for test-1 (expect test-2 in t1_file_overlap)" \
 run "POST /v1/propose_topic from test-2 (2nd distinct user — expect promotable=true)" \
   -X POST "http://localhost:${PORT_API}/v1/propose_topic" \
   -H 'Content-Type: application/json' \
-  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -H 'X-Claustrum-User-Email: bob@finder.com' \
   -d '{"uid":"test-2","name":"claustrum/dedup-core","description":"same name, different person"}'
 
 # --- Phase 4: claim / release / resume_check / inbox_drain / reset -----------
@@ -171,7 +171,7 @@ run "POST /v1/claim test-1 (expect 200, conflicts=[])" \
 run "POST /v1/claim test-2 SAME path (expect 200, conflicts includes test-1)" \
   -X POST "http://localhost:${PORT_API}/v1/claim" \
   -H 'Content-Type: application/json' \
-  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -H 'X-Claustrum-User-Email: bob@finder.com' \
   -d '{"uid":"test-2","repo":"joewaller/claustrum","rel_path":"cloud/server/app/routes/list_peers.py","ttl_seconds":3600}'
 
 run "POST /v1/release test-1 (expect 200 ok)" \
@@ -197,16 +197,16 @@ psql "$CLAUSTRUM_DB_URL" -v ON_ERROR_STOP=1 -c \
 
 run "GET /v1/inbox_drain test-2 (expect 200, count>=1, the broadcast)" \
   "http://localhost:${PORT_API}/v1/inbox_drain?uid=test-2" \
-  -H 'X-Claustrum-User-Email: kev@finder.com'
+  -H 'X-Claustrum-User-Email: bob@finder.com'
 
 run "GET /v1/inbox_drain test-2 again (expect 200, count=0 — already delivered)" \
   "http://localhost:${PORT_API}/v1/inbox_drain?uid=test-2" \
-  -H 'X-Claustrum-User-Email: kev@finder.com'
+  -H 'X-Claustrum-User-Email: bob@finder.com'
 
 run "POST /v1/reset for kev (expect 200, deleted.sessions>=1)" \
   -X POST "http://localhost:${PORT_API}/v1/reset" \
   -H 'Content-Type: application/json' \
-  -H 'X-Claustrum-User-Email: kev@finder.com' \
+  -H 'X-Claustrum-User-Email: bob@finder.com' \
   -d '{}'
 
 echo "--- DB row check ---"

@@ -242,7 +242,7 @@ def test_live_yes_writes_only_filtered_kind_and_reason(fresh_db, capsys):
     assert _approved(fresh_db) == [("topic", "artefacts-zq", "artifacts-zq", "joe@finder.com")]
 
     # The rest, unfiltered, as a second batch: the adopter-only topic + the domain.
-    assert main(["approve-plan", "--live", "--by", "kev@finder.com", "--yes"]) == 0
+    assert main(["approve-plan", "--live", "--by", "bob@finder.com", "--yes"]) == 0
     approved = {(k, a): c for k, a, c, _ in _approved(fresh_db)}
     assert approved[("topic", "omega-zq-other")] == "alpha-zq-thing"
     assert {k for k, _ in approved} == {"topic", "domain"}
