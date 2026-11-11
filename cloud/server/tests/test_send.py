@@ -28,7 +28,7 @@ def test_allows_to_uid_or_to_email():
     # These pass the guard, then hit the DB — which isn't available in a unit
     # test — so we only assert the guard did NOT raise a 400 first.
     for req in (SendRequest(to_uid="abc", body="hi"),
-                SendRequest(to_email="nicole@finder.com", body="hi")):
+                SendRequest(to_email="alice@finder.com", body="hi")):
         try:
             _call(req)
         except HTTPException as e:  # pragma: no cover - guard must not fire

@@ -155,7 +155,7 @@ claustrum send --uid <your-id> --to <their-id> --body "don't touch middleware.ts
 # session. It arrives as *context the receiving agent reads*, not a command that
 # auto-runs. To type a prompt straight into a running session, see Conductor's
 # local `route` (below) — that's same-machine only.
-claustrum send --uid <your-id> --to-email nicole@finder.com --body "can you check the FBB deal sheet?"
+claustrum send --uid <your-id> --to-email alice@finder.com --body "can you check the FBB deal sheet?"
 
 # Broadcast to all sessions
 claustrum send --uid <your-id> --to all --body "renamed UserService to AccountService"
@@ -538,8 +538,8 @@ close that gap:
 
   ```
   Claustrum overlap check (first edit on feat/x) — other work overlaps what this session is about to start:
-    • Live: kelly (kelly-mbp) editing artefacts/publish.py — artefacts publish flow
-    • Planned: pritom — "Artefacts sharing links" (artefacts) [intent #12, shares artefacts/]
+    • Live: carol (carol-mbp) editing artefacts/publish.py — artefacts publish flow
+    • Planned: dave — "Artefacts sharing links" (artefacts) [intent #12, shares artefacts/]
     • Open PR #431 by anto — "feat(artefacts): share links" (branch feat/share-links) [shares artefacts/] https://github.com/…/pull/431
   STOP: tell the user about this overlap (who, what, where, PR/intent #) and ask whether to proceed, coordinate with them first, or change approach. Retry this tool call only after they answer — this overlap set will not block again in this session.
   (Gate off: CLAUSTRUM_OVERLAP_GATE=0)

@@ -1238,7 +1238,7 @@ def test_skill_hands_the_judge_a_capped_list(monkeypatch):
 def test_render_related_tier():
     lines = cli._render_cloud_tiers({
         "t3b_related": {"count": 2, "peers": [
-            {"user_email": "kelly@finder.com", "topic": "artefacts-reviews"},
+            {"user_email": "carol@finder.com", "topic": "artefacts-reviews"},
         ]},
     })
     assert any("2 session(s) on related topics" in l and "artefacts-reviews" in l for l in lines)

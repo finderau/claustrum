@@ -66,7 +66,7 @@ def cli(tmp_path, monkeypatch):
         calls["list"] += 1
         return {
             "tiers": {"t3_topic": {"topic": "claustrum-hooks", "count": 2,
-                                   "peers": [{"user_email": "nicole@finder.com"}]}},
+                                   "peers": [{"user_email": "alice@finder.com"}]}},
             "solved": [],
         }
 

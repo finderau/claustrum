@@ -43,12 +43,12 @@ def _load_cli():
 claustrum = _load_cli()
 
 T1_PEER = {
-    "uid": "kelly-1", "user_email": "kelly@finder.com", "machine": "kelly-mbp",
+    "uid": "carol-1", "user_email": "carol@finder.com", "machine": "carol-mbp",
     "topic": "artefacts", "working_on": "artefacts publish flow",
     "overlap_files": ["artefacts/publish.py"],
 }
 INTENT = {
-    "id": 12, "person": "pritom@finder.com", "title": "Artefacts sharing links",
+    "id": 12, "person": "dave@finder.com", "title": "Artefacts sharing links",
     "paths": ["artefacts"], "match": "path", "shared": "artefacts", "pr_number": None,
 }
 PR = {
@@ -120,8 +120,8 @@ def test_blocks_once_then_retry_passes(gate, capsys):
     blocked, err = _run(m, _edit(st), capsys)
     assert blocked
     assert "Claustrum overlap check (first edit on main)" in err
-    assert "Live: kelly (kelly-mbp) editing artefacts/publish.py — artefacts publish flow" in err
-    assert 'Planned: pritom — "Artefacts sharing links" (artefacts) [intent #12, shares artefacts/]' in err
+    assert "Live: carol (carol-mbp) editing artefacts/publish.py — artefacts publish flow" in err
+    assert 'Planned: dave — "Artefacts sharing links" (artefacts) [intent #12, shares artefacts/]' in err
     assert "Open PR #431 by anto" in err and "https://github.com/o/r/pull/431" in err
     assert "tell the user" in err and "ask whether to proceed" in err
     assert "CLAUSTRUM_OVERLAP_GATE=0" in err
