@@ -340,6 +340,53 @@ def test_tick_classify_covers_settled_placeholder():
     assert cli._tick_classify_covers(0, "claude", real, age_seconds=settle, label=label) is False
 
 
+def test_tick_classify_covers_placeholder_with_transcript_and_topic():
+    pane = "tmux-host-%23-4242"
+    settle = cli.PLACEHOLDER_SETTLE_SECONDS
+    # A settled placeholder already guessed from its name doesn't re-guess every
+    # cooldown...
+    assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle,
+                                     label="know-love-ability-click", has_topic=True) is False
+    # ...but does reclassify once its argv-resolved transcript has volume.
+    assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle,
+                                     transcript_chars=1200, has_topic=True) is True
+
+
+def test_claude_session_id_from_cmd():
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    assert cli._claude_session_id_from_cmd(f"/x/claude --session-id {sid} -p") == sid
+    assert cli._claude_session_id_from_cmd(f"claude --resume={sid}") == sid
+    assert cli._claude_session_id_from_cmd(f"claude -r {sid}") == sid
+    assert cli._claude_session_id_from_cmd("claude --verbose") is None
+    assert cli._claude_session_id_from_cmd(f"claude --resume {sid} --fork-session") is None
+
+
+def test_rename_due_waits_for_volume_and_cooldown():
+    now = 10_000
+    assert cli._rename_due(0, 1199, 0, now, 0) is False
+    assert cli._rename_due(0, 1200, 0, now, 0) is True
+    assert cli._rename_due(20, 0, 0, now, 0) is True
+    assert cli._rename_due(0, 5000, now - 1, now, 0) is False     # cooling down
+    assert cli._rename_due(0, 5000, 0, now, 1) is False           # private
+    assert cli._rename_due(0, 5000, 0, now, 0, attempts=cli.NAME_REFINE_ATTEMPTS) is False
+
+
+def test_resolve_checkin_uid():
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    env = {"CLAUDE_CODE_SESSION_ID": sid}
+    assert cli._resolve_checkin_uid(None, env=env) == (sid, None)
+    uid, note = cli._resolve_checkin_uid("artefact-inline-edit", env=env)
+    assert uid == sid and "artefact-inline-edit" in note
+    other = "11111111-2222-3333-4444-555555555555"
+    assert cli._resolve_checkin_uid(other, env=env) == (other, None)      # real uid honoured
+    assert cli._resolve_checkin_uid("named", env=env, known=True) == ("named", None)
+    assert cli._resolve_checkin_uid("abc", env={}) == ("abc", None)
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid(None, env={})
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid("artefact-inline-edit", env={}, pane_uid="real-uid")
+
+
 def test_tick_classify_covers_volume_threshold():
     claude = "3f2a1b8c-0000-4000-8000-000000000000"  # real hook uid
     pane = "tmux-host-%23"                            # adopted pane uid
@@ -447,10 +494,11 @@ class _FakeDB:
         pass
 
 
-def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=()):
+def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=(),
+                signal="SIGNAL\n\n" + cli._TRANSCRIPT_MARK + "\nuser: work"):
     monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
     monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(row))
-    monkeypatch.setattr(cli, "_classify_signal", lambda r: "SIGNAL")
+    monkeypatch.setattr(cli, "_classify_signal", lambda r: signal)
     monkeypatch.setattr(cli, "_cloud_domains",
                         lambda **k: [{"name": n, "description": n} for n in dom_names])
     monkeypatch.setattr(cli, "_cloud_topics", lambda **k: list(topics))
@@ -487,6 +535,25 @@ def test_skill_picks_existing_domain_and_topic(monkeypatch):
     assert calls["propose_domain"] == [] and calls["propose_topic"] == []  # match-first: nothing minted
     uid, ctopic, cdomain, conf = calls["classify_self"]
     assert cdomain == "data" and conf == cli.CLASSIFY_SKILL_CONF
+
+
+def test_skill_name_only_pick_is_low_confidence_and_unlocked(monkeypatch):
+    # A pick with no transcript behind it (adopted pane, name only) must not be
+    # final: below the floor and unlocked so the tick replaces it once the
+    # transcript exists.
+    calls = _wire_skill(
+        monkeypatch, _row(),
+        judge=lambda mode, cands: {"choice": "data" if mode == "domain" else "revenue-analysis",
+                                   "is_new": False, "description": ""},
+        topics=[{"name": "revenue-analysis", "domain": "data", "description": "t"}],
+        signal="SESSION NAME (hint only): revenue-dash",
+    )
+    locks = []
+    monkeypatch.setattr(cli, "_set_local_topic",
+                        lambda db, uid, topic, conf, domain=None, lock=False: locks.append((conf, lock)))
+    cli.run_classification_skill("u")
+    assert calls["classify_self"][3] == cli.CLASSIFY_LABEL_ONLY_CONF < cli.CLASSIFY_CONF_FLOOR
+    assert locks == [(cli.CLASSIFY_LABEL_ONLY_CONF, False)]
 
 
 def test_skill_mints_new_domain_then_topic(monkeypatch):

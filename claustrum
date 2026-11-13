@@ -122,6 +122,10 @@ CLASSIFY_TRIGGER_TURN = 2        # fire once a session has had this many turns (
                                  # A new session starts Unclassified (no load-time
                                  # keyword guess); by turn 2 its transcript reflects
                                  # the real subject, so the skill classifies then.
+CLASSIFY_LABEL_ONLY_CONF = 60   # confidence for a pick made from a session NAME with no
+                                 # transcript. Below the floor and never locked, so the
+                                 # tick reclassifies it once real transcript exists.
+NAME_REFINE_ATTEMPTS = 3
 CLASSIFY_MIN_LINES = 20          # pure volume threshold: fire once a session transcript
 CLASSIFY_MIN_CHARS = 1200        # has reached at least this many rendered dialogue lines
                                  # or characters, regardless of turn count.
@@ -1820,6 +1824,9 @@ def _init_schema(db):
         # may replace it with an LLM-written one; NULL once refined (or never set),
         # so a name a human or agent chose is never overwritten.
         ("auto_label", "TEXT"),
+        # name_attempts: refine runs spent on the pending auto_label, capped at
+        # NAME_REFINE_ATTEMPTS so a judge that keeps failing can't re-fire forever.
+        ("name_attempts", "INTEGER DEFAULT 0"),
         # private: 1 when the session ran under CLAUSTRUM_PRIVATE (never cloud-
         # published). Recorded locally so the footer can render the 🔒 glyph AND
         # so the machine-level heartbeat — which has no CLAUSTRUM_PRIVATE in its
@@ -2442,15 +2449,40 @@ def _rename_tmux_session(target, name):
     return None
 
 
+def _pane_auto_label(pane, db=None):
+    """The pending auto placeholder name for a tmux pane, from whichever row on
+    that pane holds it (the hook row sets it; an adopted placeholder or a later
+    relaunch row on the same pane does not)."""
+    if not pane:
+        return None
+    own = db is None
+    db = db or get_db()
+    try:
+        r = db.execute(
+            "SELECT auto_label FROM sessions WHERE tmux_pane = ? AND auto_label IS NOT NULL "
+            "AND (host IS NULL OR host = ?) ORDER BY last_seen DESC LIMIT 1",
+            (pane, _host()),
+        ).fetchone()
+        return r["auto_label"] if r else None
+    except Exception:
+        return None
+    finally:
+        if own:
+            db.close()
+
+
 def _refine_auto_name(uid):
     """Replace a session's auto placeholder name with an LLM-written one, grounded
     in the transcript rather than a keyword skim of the first prompt.
 
-    Runs once, from the detached classification skill (so the transcript already
-    reflects the real work). Only acts while the live tmux name still equals the
-    placeholder we set — a name a human or the agent chose since is kept.
-    Clears auto_label afterwards either way, so it never fires twice. Best-effort:
-    returns the new name, or None."""
+    Runs from the detached classification skill, which the heartbeat also fires
+    for a pending name once the transcript has volume — independent of whether
+    the session is already classified. The placeholder is looked up by pane, so
+    it is found even when another row on the pane (an adopted placeholder, a
+    relaunch) is the one being classified. Only acts while the live tmux name
+    still equals the placeholder — a name a human or the agent chose since is
+    kept. Clears the pane's auto_label afterwards either way, so it never fires
+    twice. Best-effort: returns the new name, or None."""
     if not os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
         return None
     db = get_db()
@@ -2459,9 +2491,10 @@ def _refine_auto_name(uid):
             "SELECT uid, label, task, transcript_path, cwd, agent, pid, started_at, "
             "auto_label, tmux_pane, private FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
+        auto = (row["auto_label"] or _pane_auto_label(row["tmux_pane"], db)) if row else None
     finally:
         db.close()
-    if not row or not row["auto_label"] or row["private"] or not row["tmux_pane"]:
+    if not row or not auto or row["private"] or not row["tmux_pane"]:
         return None
     try:
         cur = subprocess.run(
@@ -2472,27 +2505,34 @@ def _refine_auto_name(uid):
     except Exception:
         return None
     new_name = None
-    if live == row["auto_label"]:
+    if live == auto:
         signal = _classify_signal(row)
         if not signal:
             return None  # nothing to go on yet — keep auto_label, retry next run
+        db = get_db()
+        try:
+            db.execute("UPDATE sessions SET name_attempts = COALESCE(name_attempts, 0) + 1 "
+                       "WHERE uid = ?", (uid,))
+            db.commit()
+        finally:
+            db.close()
         try:
             name = _judge_with_retries("name", signal, [])["choice"]
         except ClassifyJudgeError:
             return None
-        if not _valid_session_name(name) or name == live:
+        if not _valid_session_name(name):
             return None
-        try:
-            new_name = _rename_tmux_session(row["tmux_pane"], name)
-        except Exception:
-            return None
+        if name != live:
+            try:
+                new_name = _rename_tmux_session(row["tmux_pane"], name)
+            except Exception:
+                return None
     db = get_db()
     try:
+        db.execute("UPDATE sessions SET auto_label = NULL WHERE tmux_pane = ? "
+                   "AND (host IS NULL OR host = ?)", (row["tmux_pane"], _host()))
         if new_name:
-            db.execute("UPDATE sessions SET label = ?, auto_label = NULL WHERE uid = ?",
-                       (new_name, uid))
-        else:
-            db.execute("UPDATE sessions SET auto_label = NULL WHERE uid = ?", (uid,))
+            db.execute("UPDATE sessions SET label = ? WHERE uid = ?", (new_name, uid))
         db.commit()
     finally:
         db.close()
@@ -2561,9 +2601,12 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
                     break
         if keep:
             p_locked = keep["classify_locked"] if "classify_locked" in keep.keys() else 1
-            # A placeholder's lock came from a label-only guess; leave the real
+            p_conf = keep["topic_confidence"]
+            # A placeholder's pick came from a label-only guess; leave the real
             # session free to reclassify from its transcript.
             if keep["uid"].startswith("tmux-"):
+                if not p_locked:
+                    p_conf = min(p_conf or 0, CLASSIFY_LABEL_ONLY_CONF)
                 p_locked = 0
             db.execute(
                 "UPDATE sessions SET "
@@ -2574,7 +2617,7 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
                 "classify_locked = CASE WHEN classify_locked IS NULL OR classify_locked = 0 THEN ? "
                 "ELSE classify_locked END "
                 "WHERE uid = ?",
-                (keep["domain"], keep["topic"], keep["topic_confidence"], p_locked, uid),
+                (keep["domain"], keep["topic"], p_conf, p_locked, uid),
             )
     for p in preds:
         db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
@@ -2919,6 +2962,42 @@ def _descendant_pids(pid):
     return seen
 
 
+_CLAUDE_SESSION_ARG_RE = re.compile(
+    r"(?:^|\s)(?:--session-id|--resume|-r)[=\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b"
+)
+
+
+def _claude_session_id_from_cmd(cmd):
+    """The session UUID a `claude` process was launched with (--session-id /
+    --resume), as Conductor's rich launches do. None for a bare `claude`, or a
+    --fork-session resume, whose argv names the parent transcript."""
+    if "--fork-session" in (cmd or ""):
+        return None
+    m = _CLAUDE_SESSION_ARG_RE.search(cmd or "")
+    return m.group(1) if m else None
+
+
+def _find_claude_transcript_by_pid(pid):
+    """Resolve an adopted Claude pane's transcript from its launch argv, so a
+    placeholder row classifies from the real conversation instead of its name.
+    May be stale after an in-process /clear, which is fine: the hook row that
+    replaces the placeholder carries its own transcript_path."""
+    if not pid:
+        return None
+    try:
+        import glob
+        r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=2)
+        sid = _claude_session_id_from_cmd(r.stdout)
+        if sid:
+            m = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl"))
+            if m:
+                return m[0]
+    except Exception:
+        pass
+    return None
+
+
 def _find_codex_by_pid(pid):
     """Find a codex session's rollout from the files its process tree holds open —
     the `codex app-server` child keeps its active rollout-*.jsonl open, so this is
@@ -3242,6 +3321,10 @@ def _classify_signal(row):
     label = (row["label"] or "").strip()
     task = (row["task"] or "").strip()
     auto = (row["auto_label"] if "auto_label" in row.keys() else None) or ""
+    if not auto and "tmux_pane" in row.keys() and row["tmux_pane"]:
+        # The hook row holds auto_label; an adopted placeholder on the same pane
+        # wears the same name but has none of its own.
+        auto = _pane_auto_label(row["tmux_pane"]) or ""
     # An auto placeholder is a keyword skim of the first prompt, not a curated
     # name — it must not lead the signal as if it were.
     descriptive = bool(label) and not _is_generic_label(label) and label != auto
@@ -3268,6 +3351,10 @@ def _classify_signal(row):
             p = _find_codex_by_pid(pid)
             if p:
                 tpath, tkind = p, "codex"
+        elif ag == "claude" and pid:
+            p = _find_claude_transcript_by_pid(pid)
+            if p:
+                tpath, tkind = p, "claude"
     if not tpath and not descriptive:
         # No clean label to lead with — fall back to a correlated transcript.
         started_at = row["started_at"] if "started_at" in row.keys() else None
@@ -3531,11 +3618,20 @@ def run_classification_skill(uid):
             domain = resp.get("domain") or domain
 
     # --- Retain: cloud is authoritative, local DB mirrors it ----------------
-    _cloud_classify_self(uid, topic, confidence=CLASSIFY_SKILL_CONF, domain=domain,
+    # Only a transcript-grounded pick is final. A name-only guess stays below the
+    # floor and unlocked so the tick replaces it once the transcript exists.
+    grounded = _TRANSCRIPT_MARK in signal
+    conf = CLASSIFY_SKILL_CONF if grounded else CLASSIFY_LABEL_ONLY_CONF
+    _cloud_classify_self(uid, topic, confidence=conf, domain=domain,
                          timeout=CLOUD_TIMEOUT_INTERACTIVE)
     db = get_db()
     try:
-        _set_local_topic(db, uid, topic, CLASSIFY_SKILL_CONF, domain=domain, lock=True)
+        _set_local_topic(db, uid, topic, conf, domain=domain, lock=grounded)
+        if not grounded:
+            # Success doesn't normally spend an attempt; an ungrounded one must, or
+            # the below-floor confidence would re-fire it every cooldown forever.
+            db.execute("UPDATE sessions SET classify_attempts = COALESCE(classify_attempts, 0) + 1 "
+                       "WHERE uid = ?", (uid,))
         db.commit()
     finally:
         db.close()
@@ -3543,7 +3639,7 @@ def run_classification_skill(uid):
 
 
 def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript_chars=0,
-                          age_seconds=0, label=""):
+                          age_seconds=0, label="", has_topic=False):
     """Whether the machine-wide heartbeat tick — the AGENT-AGNOSTIC trigger —
     should classify this session. Pure so it's unit-tested.
 
@@ -3555,9 +3651,11 @@ def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript
       2. Turn threshold: turn_count >= CLASSIFY_TRIGGER_TURN (legacy / terse chats).
 
       3. Settled Claude placeholder: a claude tmux- placeholder older than
-         PLACEHOLDER_SETTLE_SECONDS with a descriptive label. No hook replaced it
-         (e.g. an idle pane restored after a reboot), so it classifies from its
-         label via _classify_signal.
+         PLACEHOLDER_SETTLE_SECONDS. No hook replaced it (e.g. an idle pane
+         restored after a reboot, or a Conductor launch between prompts). It
+         classifies from the transcript resolved off its launch argv once that
+         has volume; failing that, ONCE from a descriptive label (has_topic
+         stops the name-only guess repeating every cooldown).
 
     Never covers empty sessions (0 lines, 0 chars, 0 turns) or an unsettled Claude
     placeholder — during a relaunch gap the real hook session re-registers within
@@ -3565,12 +3663,72 @@ def _tick_classify_covers(turn_count, agent, uid, transcript_lines=0, transcript
     tc = turn_count or 0
     is_placeholder = (uid or "").startswith("tmux-")
     if is_placeholder and agent == "claude":
-        return age_seconds >= PLACEHOLDER_SETTLE_SECONDS and not _is_generic_label(label)
+        if age_seconds < PLACEHOLDER_SETTLE_SECONDS:
+            return False
+        if transcript_lines >= CLASSIFY_MIN_LINES or transcript_chars >= CLASSIFY_MIN_CHARS:
+            return True
+        return not has_topic and not _is_generic_label(label)
     if transcript_lines >= CLASSIFY_MIN_LINES or transcript_chars >= CLASSIFY_MIN_CHARS:
         return True
     if tc >= CLASSIFY_TRIGGER_TURN:
         return True
     return False
+
+
+def _rename_due(transcript_lines, transcript_chars, spawned_at, now, private, attempts=0):
+    """Whether a pending auto placeholder name should be refined now. Pure so
+    it's unit-tested. Waits for transcript volume (the first full reply clears
+    CLASSIFY_MIN_CHARS) rather than for classification, which may already be
+    locked or may have run against another row on the pane."""
+    if private or (attempts or 0) >= NAME_REFINE_ATTEMPTS:
+        return False
+    if now - (spawned_at or 0) < CLASSIFY_SKILL_COOLDOWN:
+        return False
+    return transcript_lines >= CLASSIFY_MIN_LINES or transcript_chars >= CLASSIFY_MIN_CHARS
+
+
+def _tick_refine_pending_names(host, now, budget):
+    """Fire the skill (which refines names after classifying) for live panes
+    whose auto placeholder name is still pending. Returns how many it spawned."""
+    if budget <= 0 or not os.environ.get("CLAUSTRUM_CLASSIFY_CMD"):
+        return 0
+    db = get_db()
+    try:
+        rows = db.execute(
+            "SELECT s.uid, s.tmux_pane, s.agent, s.cwd, s.started_at, s.transcript_path, "
+            "s.classify_spawned_at, COALESCE(s.name_attempts,0) AS name_attempts, "
+            "COALESCE(s.private,0) AS private FROM sessions s "
+            "WHERE s.status IN ('active','stale') AND s.tmux_pane IS NOT NULL "
+            "AND (s.host IS NULL OR s.host = ?) "
+            "AND EXISTS (SELECT 1 FROM sessions a WHERE a.tmux_pane = s.tmux_pane "
+            "AND a.auto_label IS NOT NULL AND (a.host IS NULL OR a.host = ?)) "
+            "ORDER BY (s.uid LIKE 'tmux-%'), s.last_seen DESC",
+            (host, host),
+        ).fetchall()
+    finally:
+        db.close()
+    spawned, seen_panes = 0, set()
+    for r in rows:
+        if spawned >= budget:
+            break
+        if r["tmux_pane"] in seen_panes:
+            continue  # one refine per pane; the hook row is preferred over a placeholder
+        seen_panes.add(r["tmux_pane"])
+        if not _rename_due(CLASSIFY_MIN_LINES, 0, r["classify_spawned_at"], now,
+                           r["private"], r["name_attempts"]):
+            continue  # cooling down / capped: skip the transcript I/O
+        try:
+            tpath, tkind = r["transcript_path"], (r["agent"] or "claude")
+            if not tpath:
+                tpath, tkind = _find_transcript(r["uid"], r["cwd"], agent=r["agent"],
+                                                started_at=r["started_at"])
+            lines, chars = _transcript_volume(tpath, tkind) if tpath else (0, 0)
+        except Exception:
+            continue
+        if _rename_due(lines, chars, r["classify_spawned_at"], now, r["private"],
+                       r["name_attempts"]) and _spawn_classify_skill(r["uid"], name_only=True):
+            spawned += 1
+    return spawned
 
 
 def _classify_skill_due(conf, attempts, failed, spawned_at, now, private, locked=0):
@@ -3591,7 +3749,7 @@ def _classify_skill_due(conf, attempts, failed, spawned_at, now, private, locked
     return True
 
 
-def _spawn_classify_skill(uid):
+def _spawn_classify_skill(uid, name_only=False):
     """Fire the skill in a DETACHED process so it never blocks the caller (the
     prompt hook or the heartbeat tick). The child talks to the cloud, so it must
     NOT inherit CLAUSTRUM_PRIVATE — the LLM sub-process sets that itself. Stamps
@@ -3605,7 +3763,8 @@ def _spawn_classify_skill(uid):
         logf = subprocess.DEVNULL
     try:
         subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "classify-skill", "--uid", uid],
+            [sys.executable, os.path.abspath(__file__), "classify-skill", "--uid", uid,
+             *(["--name-only"] if name_only else [])],
             stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
             start_new_session=True, close_fds=True,
         )
@@ -4653,8 +4812,72 @@ def hook_stop(_args):
 # CLI commands  (invoked directly by user or by Claude via Bash tool)
 # ---------------------------------------------------------------------------
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _resolve_checkin_uid(given, env=None, pane_uid=None, known=False):
+    """The uid a manual `checkin` should write. Pure so it's unit-tested.
+
+    Agents told to `checkin --uid <session-id>` routinely invent one (a task
+    slug), which mints a ghost row that then out-ranks the real hook row for its
+    pane. So: inside Claude Code the harness session id always wins; elsewhere an
+    unknown uid is refused when the pane is already registered under another.
+    Returns (uid, note) or raises ValueError."""
+    env = os.environ if env is None else env
+    own = env.get("CLAUDE_CODE_SESSION_ID")
+    if own and (given is None or not (_UUID_RE.fullmatch(given) or known)):
+        # An inherited env var must not hijack a real uid (UUID or known row);
+        # only an invented slug is replaced.
+        note = None if given is None else f"ignoring --uid {given}: this session is {own}"
+        return own, note
+    if not given:
+        raise ValueError("--uid is required outside Claude Code")
+    if pane_uid and pane_uid != given:
+        raise ValueError(
+            f"this pane is already registered as {pane_uid}; the prompt hook keeps it "
+            f"checked in. Rename the session with `claustrum rename <slug>` instead.")
+    return given, None
+
+
+def _session_exists(uid):
+    if not uid:
+        return False
+    db = get_db()
+    try:
+        return db.execute("SELECT 1 FROM sessions WHERE uid = ?", (uid,)).fetchone() is not None
+    finally:
+        db.close()
+
+
+def _pane_registered_uid(pane, given):
+    """The live non-placeholder uid already registered for a pane, unless it's `given`."""
+    if not pane:
+        return None
+    db = get_db()
+    try:
+        r = db.execute(
+            "SELECT uid FROM sessions WHERE tmux_pane = ? AND (host IS NULL OR host = ?) "
+            "AND status IN ('active','stale') AND uid NOT LIKE 'tmux-%' AND uid != ? "
+            "AND NOT EXISTS (SELECT 1 FROM sessions g WHERE g.uid = ?) "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (pane, _host(), given or "", given or ""),
+        ).fetchone()
+        return r["uid"] if r else None
+    finally:
+        db.close()
+
+
 def cmd_checkin(args):
     """Register or update a session."""
+    try:
+        args.uid, note = _resolve_checkin_uid(
+            args.uid, pane_uid=_pane_registered_uid(os.environ.get("TMUX_PANE"), args.uid),
+            known=_session_exists(args.uid))
+    except ValueError as e:
+        print(f"claustrum checkin: {e}", file=sys.stderr)
+        sys.exit(2)
+    if note:
+        print(f"claustrum checkin: {note}", file=sys.stderr)
     db = get_db()
     now = time.time()
     # Capture liveness fields from the current environment (the agent runs this
@@ -4926,6 +5149,8 @@ def cmd_heartbeat(args):
                             tpath = p
                 elif kind == "codex":
                     tpath = _find_codex_by_pid(cpid)
+                elif kind == "claude":
+                    tpath = _find_claude_transcript_by_pid(cpid)
                 # Record the pane's agent kind on the placeholder. A 'claude'
                 # placeholder is usually a churn stand-in during a relaunch gap
                 # (the real hook session re-registers and classifies itself), so
@@ -5084,7 +5309,7 @@ def cmd_heartbeat(args):
                     "SELECT uid, topic_confidence, classify_attempts, classify_failed, "
                     "classify_spawned_at, COALESCE(turn_count,0) AS turn_count, "
                     "COALESCE(private,0) AS private, COALESCE(classify_locked,0) AS classify_locked, "
-                    "agent, cwd, transcript_path, started_at, pid, label "
+                    "agent, cwd, transcript_path, started_at, pid, label, topic "
                     "FROM sessions WHERE status IN ('active','stale') "
                     "AND COALESCE(topic_confidence,0) < ? "
                     "AND COALESCE(classify_locked, 0) = 0 "
@@ -5114,13 +5339,15 @@ def cmd_heartbeat(args):
                             pass
                 lines, chars = _transcript_volume(tpath, tkind) if tpath else (0, 0)
                 if _tick_classify_covers(r["turn_count"], r["agent"], r["uid"], transcript_lines=lines, transcript_chars=chars,
-                                         age_seconds=now - (r["started_at"] or now), label=r["label"] or "") \
+                                         age_seconds=now - (r["started_at"] or now), label=r["label"] or "",
+                                         has_topic=bool(r["topic"])) \
                     and _classify_skill_due(
                         r["topic_confidence"], r["classify_attempts"],
                         r["classify_failed"], r["classify_spawned_at"], now, r["private"],
                         locked=r["classify_locked"],
                     ) and _spawn_classify_skill(r["uid"]):
                     spawned += 1
+            spawned += _tick_refine_pending_names(host, now, CLASSIFY_SKILL_TICK_CAP - spawned)
         except Exception:
             pass
     # Push reaped + deduped-away + drained sessions off the live board (active -> paused).
@@ -5226,6 +5453,11 @@ def cmd_classify_skill(args):
     precondition (no transcript yet, cloud down) spends NO attempt and just
     retries after the cooldown."""
     uid = args.uid
+    if getattr(args, "name_only", False):
+        renamed = _refine_auto_name(uid)
+        if renamed:
+            print(f"renamed {uid}: {renamed}")
+        return
     try:
         domain, topic = run_classification_skill(uid)
         if topic:
@@ -5342,6 +5574,33 @@ def cmd_classify_self(args):
 
     if not peers and not prs and not solved:
         print("No prior sessions on this topic — you're first.")
+
+
+def cmd_rename(args):
+    """Rename this session's tmux session (its board name). A chosen name is never
+    overwritten by the auto-namer, so this also cancels any pending auto refine."""
+    name = (args.name or "").strip().lower().replace(" ", "-")
+    if not _valid_session_name(name):
+        print("claustrum rename: name must be a 2-5 word kebab-case slug, max 40 chars "
+              "(e.g. user-editable-artefacts)", file=sys.stderr)
+        sys.exit(2)
+    pane = os.environ.get("TMUX_PANE")
+    if not pane or not os.environ.get("TMUX"):
+        print("claustrum rename: not inside tmux", file=sys.stderr)
+        sys.exit(2)
+    stuck = _rename_tmux_session(pane, name)
+    if not stuck:
+        print(f"claustrum rename: tmux refused '{name}'", file=sys.stderr)
+        sys.exit(1)
+    db = get_db()
+    try:
+        db.execute("UPDATE sessions SET auto_label = NULL, label = CASE WHEN status IN "
+                   "('active','stale') THEN ? ELSE label END WHERE tmux_pane = ? "
+                   "AND (host IS NULL OR host = ?)", (stuck, pane, _host()))
+        db.commit()
+    finally:
+        db.close()
+    print(f"Renamed to {stuck}.")
 
 
 def cmd_reclassify(args):
@@ -6299,7 +6558,7 @@ def main():
 
     # -- checkin --
     p = sub.add_parser("checkin", help="Register or update a session")
-    p.add_argument("--uid", required=True)
+    p.add_argument("--uid", help="Defaults to this Claude Code session's id (which also overrides any other value)")
     p.add_argument("--task")
     p.add_argument("--files")
     p.add_argument("--cwd")
@@ -6342,6 +6601,9 @@ def main():
         help="Domain to record on the session (default: derived from the topic)",
     )
 
+    p = sub.add_parser("rename", help="Rename this session's board (tmux) name")
+    p.add_argument("name", help="2-5 word kebab-case slug, e.g. user-editable-artefacts")
+
     p = sub.add_parser(
         "reclassify",
         help="Unlock a session so it re-classifies (undo a wrong locked pick)",
@@ -6355,6 +6617,8 @@ def main():
              "(internal; spawned detached by the prompt hook + heartbeat)",
     )
     p.add_argument("--uid", required=True)
+    p.add_argument("--name-only", action="store_true",
+                   help="Only refine a pending auto placeholder name; skip classification")
 
     # -- cloud-sync (detached cloud write-through spawned by the prompt hook) --
     p = sub.add_parser(
@@ -6534,6 +6798,8 @@ def main():
         cmd_domains(args)
     elif args.command == "classify-self":
         cmd_classify_self(args)
+    elif args.command == "rename":
+        cmd_rename(args)
     elif args.command == "reclassify":
         cmd_reclassify(args)
     elif args.command == "classify-skill":
