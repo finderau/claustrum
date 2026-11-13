@@ -2478,9 +2478,10 @@ def _live_session_name(pane):
             ["tmux", "display-message", "-t", pane, "-p", "#{session_name}"],
             capture_output=True, text=True, timeout=2,
         )
-        return (cur.stdout or "").strip()
     except Exception:
         return None
+    name = (cur.stdout or "").strip()
+    return name if cur.returncode == 0 and name else None
 
 
 def _refine_auto_name(uid):

@@ -245,3 +245,13 @@ def test_refine_keeps_auto_label_when_tmux_refuses(env, monkeypatch):
     monkeypatch.setattr(cli.subprocess, "run", refuse)
     assert cli._refine_auto_name("u1") is None
     assert _row()["auto_label"] == "yo-still-think-have"
+
+
+def test_refine_keeps_auto_label_when_live_name_unreadable(env, monkeypatch):
+    def fail(cmd, **_):
+        if cmd[:2] == ["tmux", "display-message"]:
+            return _Proc(returncode=1)
+        raise AssertionError(cmd)
+    monkeypatch.setattr(cli.subprocess, "run", fail)
+    assert cli._refine_auto_name("u1") is None
+    assert _row()["auto_label"] == "yo-still-think-have"
