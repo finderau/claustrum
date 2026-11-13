@@ -1593,12 +1593,21 @@ def _overlap_gate(data):
     """PreToolUse overlap gate. Exits 2 (blocking the tool once) when material
     overlap exists that this session hasn't been shown yet; otherwise returns.
     Never raises — the caller still guards it."""
-    if not _overlap_gate_enabled():
-        return
-    uid = data.get("session_id", "unknown")
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input") or {}
+    uid = data.get("session_id", "unknown")
     cwd = data.get("cwd") or os.getcwd()
+
+    if not _overlap_gate_enabled():
+        if tool_name == "ExitPlanMode":
+            target_dir = cwd
+            repo, _branch = _git_info(target_dir)
+            root = _git_toplevel(target_dir)
+            plan = _plan_text(tool_input)
+            plan_title = _plan_title(plan)
+            plan_paths = _plan_paths(plan, root)
+            _spawn_plan_intent(uid, plan_title, plan_paths, repo, cwd)
+        return
 
     scope = retry_scope = None
     plan_title = plan_paths = None
