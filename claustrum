@@ -2991,22 +2991,51 @@ def _claude_session_id_from_cmd(cmd):
     return m.group(1) if m else None
 
 
+_PRIVATE_ENV_RE = re.compile(r"(?:^|\s)(?:CLAUSTRUM_PRIVATE=1|WA_PRIVATE_SESSION=1)(?:\s|$)")
+
+
+def _claude_pid_session(pid):
+    """(session_id, private) for a live `claude` process. private is True when
+    the process runs under CLAUSTRUM_PRIVATE / WA_PRIVATE_SESSION, when its
+    session's own row is private, or when its environment can't be read —
+    fail closed, so an adopted placeholder never exposes a private transcript.
+    session_id is None for a bare `claude` (no --session-id/--resume)."""
+    if not pid:
+        return None, True
+    try:
+        r = subprocess.run(["ps", "-wwE", "-o", "command=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=2)
+        out = r.stdout or ""
+        if r.returncode != 0 or "HOME=" not in out:
+            return _claude_session_id_from_cmd(out), True
+        sid = _claude_session_id_from_cmd(out)
+        private = bool(_PRIVATE_ENV_RE.search(out)) and " CLAUSTRUM_PUBLIC=1" not in out
+        if sid and not private:
+            db = get_db()
+            try:
+                row = db.execute("SELECT private FROM sessions WHERE uid = ?", (sid,)).fetchone()
+            finally:
+                db.close()
+            private = bool(row and row["private"])
+        return sid, private
+    except Exception:
+        return None, True
+
+
 def _find_claude_transcript_by_pid(pid):
     """Resolve an adopted Claude pane's transcript from its launch argv, so a
     placeholder row classifies from the real conversation instead of its name.
-    May be stale after an in-process /clear, which is fine: the hook row that
-    replaces the placeholder carries its own transcript_path."""
-    if not pid:
+    None for a private session. May be stale after an in-process /clear, which
+    is fine: the hook row that replaces the placeholder carries its own
+    transcript_path."""
+    sid, private = _claude_pid_session(pid)
+    if not sid or private:
         return None
     try:
         import glob
-        r = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
-                           capture_output=True, text=True, timeout=2)
-        sid = _claude_session_id_from_cmd(r.stdout)
-        if sid:
-            m = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl"))
-            if m:
-                return m[0]
+        m = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sid}.jsonl"))
+        if m:
+            return m[0]
     except Exception:
         pass
     return None
@@ -3555,7 +3584,7 @@ def run_classification_skill(uid):
     try:
         row = db.execute(
             "SELECT uid, topic_confidence, classify_locked, transcript_path, cwd, "
-            "label, task, private, agent, pid, started_at, auto_label, tmux_pane FROM sessions WHERE uid = ?", (uid,)
+            "label, task, private, agent, pid, started_at, auto_label, tmux_pane, topic FROM sessions WHERE uid = ?", (uid,)
         ).fetchone()
     finally:
         db.close()
@@ -3568,6 +3597,9 @@ def run_classification_skill(uid):
     signal = _classify_signal(row)
     if not signal:
         raise ClassifySkillNotReady("no transcript yet")
+    if _TRANSCRIPT_MARK not in signal and row["topic"]:
+        # Already holds a name-only pick; the same input would buy the same answer.
+        raise ClassifySkillNotReady("name-only pick already made; waiting for a transcript")
 
     # --- Domain: match-first over a ranked, capped list ---------------------
     # A new domain is NOT minted yet: if the topic pick below lands on an
@@ -4834,21 +4866,36 @@ def hook_stop(_args):
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
-def _resolve_checkin_uid(given, env=None, pane_uid=None, known=False):
+def _resolve_checkin_uid(given, env=None, pane_uid=None, given_pane=None, own_pane=None,
+                         pane=None):
     """The uid a manual `checkin` should write. Pure so it's unit-tested.
 
     Agents told to `checkin --uid <session-id>` routinely invent one (a task
-    slug), which mints a ghost row that then out-ranks the real hook row for its
-    pane. So: inside Claude Code the harness session id always wins; elsewhere an
-    unknown uid is refused when the pane is already registered under another.
-    Returns (uid, note) or raises ValueError."""
+    slug, a stale id from a shared file), which mints or revives a ghost row that
+    then out-ranks the real hook row for its pane. Rules:
+      - inside Claude Code, the harness session id wins unless `given` is a row
+        already bound to THIS pane (a deliberate re-checkin) or a brand-new UUID;
+        a uid bound to another pane is someone else's session and is replaced;
+      - with no --uid, an inherited CLAUDE_CODE_SESSION_ID whose row lives on a
+        different pane belongs to a parent process and is refused;
+      - outside Claude Code, a uid other than the pane's registered one is refused.
+    given_pane / own_pane are the tmux panes of the rows for `given` / the env
+    session id ('' = row exists with no pane, None = no row). Returns (uid, note)
+    or raises ValueError."""
     env = os.environ if env is None else env
     own = env.get("CLAUDE_CODE_SESSION_ID")
-    if own and (given is None or not (_UUID_RE.fullmatch(given) or known)):
-        # An inherited env var must not hijack a real uid (UUID or known row);
-        # only an invented slug is replaced.
-        note = None if given is None else f"ignoring --uid {given}: this session is {own}"
-        return own, note
+    if own:
+        if pane and own_pane and own_pane != pane:
+            raise ValueError(
+                f"CLAUDE_CODE_SESSION_ID {own} belongs to another pane ({own_pane}); "
+                f"pass this process's own --uid")
+        if given is None or given == own:
+            return own, None
+        mine = given_pane is not None and (not given_pane or given_pane == pane)
+        fresh_uuid = given_pane is None and bool(_UUID_RE.fullmatch(given))
+        if mine or fresh_uuid:
+            return given, None
+        return own, f"ignoring --uid {given}: this session is {own}"
     if not given:
         raise ValueError("--uid is required outside Claude Code")
     if pane_uid and pane_uid != given:
@@ -4858,12 +4905,14 @@ def _resolve_checkin_uid(given, env=None, pane_uid=None, known=False):
     return given, None
 
 
-def _session_exists(uid):
+def _session_pane(uid):
+    """The tmux pane of `uid`'s row: None if no row, '' if the row has no pane."""
     if not uid:
-        return False
+        return None
     db = get_db()
     try:
-        return db.execute("SELECT 1 FROM sessions WHERE uid = ?", (uid,)).fetchone() is not None
+        r = db.execute("SELECT tmux_pane FROM sessions WHERE uid = ?", (uid,)).fetchone()
+        return None if r is None else (r["tmux_pane"] or "")
     finally:
         db.close()
 
@@ -4877,9 +4926,8 @@ def _pane_registered_uid(pane, given):
         r = db.execute(
             "SELECT uid FROM sessions WHERE tmux_pane = ? AND (host IS NULL OR host = ?) "
             "AND status IN ('active','stale') AND uid NOT LIKE 'tmux-%' AND uid != ? "
-            "AND NOT EXISTS (SELECT 1 FROM sessions g WHERE g.uid = ?) "
             "ORDER BY last_seen DESC LIMIT 1",
-            (pane, _host(), given or "", given or ""),
+            (pane, _host(), given or ""),
         ).fetchone()
         return r["uid"] if r else None
     finally:
@@ -4888,10 +4936,13 @@ def _pane_registered_uid(pane, given):
 
 def cmd_checkin(args):
     """Register or update a session."""
+    pane_env = os.environ.get("TMUX_PANE")
     try:
         args.uid, note = _resolve_checkin_uid(
-            args.uid, pane_uid=_pane_registered_uid(os.environ.get("TMUX_PANE"), args.uid),
-            known=_session_exists(args.uid))
+            args.uid, pane_uid=_pane_registered_uid(pane_env, args.uid),
+            given_pane=_session_pane(args.uid),
+            own_pane=_session_pane(os.environ.get("CLAUDE_CODE_SESSION_ID")),
+            pane=pane_env)
     except ValueError as e:
         print(f"claustrum checkin: {e}", file=sys.stderr)
         sys.exit(2)
@@ -5170,22 +5221,24 @@ def cmd_heartbeat(args):
                     tpath = _find_codex_by_pid(cpid)
                 elif kind == "claude":
                     tpath = _find_claude_transcript_by_pid(cpid)
+                pane_private = 1 if kind == "claude" and _claude_pid_session(cpid)[1] else 0
                 # Record the pane's agent kind on the placeholder. A 'claude'
                 # placeholder is usually a churn stand-in during a relaunch gap
                 # (the real hook session re-registers and classifies itself), so
                 # the tick leaves it alone until it settles — see _tick_classify_covers.
                 db.execute(
                     "INSERT INTO sessions "
-                    "(uid, label, status, last_seen, started_at, last_activity, host, tmux_pane, pid, boot_id, agent, cwd, transcript_path) "
-                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "(uid, label, status, last_seen, started_at, last_activity, host, tmux_pane, pid, boot_id, agent, cwd, transcript_path, private) "
+                    "VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(uid) DO UPDATE SET label=excluded.label, "
                     "status='active', last_seen=excluded.last_seen, "
                     "last_activity=COALESCE(sessions.last_activity, excluded.last_activity), "
                     "tmux_pane=excluded.tmux_pane, pid=excluded.pid, boot_id=excluded.boot_id, "
                     "agent=COALESCE(excluded.agent, sessions.agent), "
                     "cwd=COALESCE(excluded.cwd, sessions.cwd), "
-                    "transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path)",
-                    (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath),
+                    "transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path), "
+                    "private=MAX(COALESCE(sessions.private, 0), excluded.private)",
+                    (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath, pane_private),
                 )
                 _retire_pane_predecessors(db, uid, host, boot, pane)
                 adopted.append((uid, label, now))

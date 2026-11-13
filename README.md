@@ -119,8 +119,8 @@ claustrum show api-tests
 
 # Manually register your session's task. Rarely needed: the prompt hook already
 # registers every session. Inside Claude Code --uid defaults to the harness
-# session id, and an invented (non-UUID, unknown) uid is replaced by it;
-# elsewhere an invented uid for an already-registered pane is refused.
+# session id, which replaces any uid not already bound to this pane (a brand-new
+# UUID excepted); elsewhere a uid other than the pane's registered one is refused.
 claustrum checkin --task "refactoring auth"
 
 # Rename this session's board name (its tmux session). Overrides the auto name.
@@ -420,7 +420,9 @@ adopted pane with no transcript) is written at `CLASSIFY_LABEL_ONLY_CONF`, below
 the floor and unlocked, and is replaced once a transcript has volume. Adopted
 Claude panes resolve their transcript from the `--session-id`/`--resume` in the
 process argv, so a Conductor launch classifies from the conversation, not its
-name. An auto placeholder name (the first-prompt keyword skim) never counts as
+name. A process running under `CLAUSTRUM_PRIVATE`/`WA_PRIVATE_SESSION`, whose
+session row is private, or whose environment can't be read is marked private
+and its transcript is never resolved. An auto placeholder name (the first-prompt keyword skim) never counts as
 a descriptive name, on any row of its pane; the heartbeat replaces it with an
 LLM-written name once the transcript clears `CLASSIFY_MIN_CHARS` (typically the
 first full reply), whether or not the session is already classified. A name set

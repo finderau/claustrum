@@ -361,6 +361,50 @@ def test_claude_session_id_from_cmd():
     assert cli._claude_session_id_from_cmd(f"claude --resume {sid} --fork-session") is None
 
 
+class _PS:
+    def __init__(self, out, rc=0):
+        self.stdout, self.returncode = out, rc
+
+
+@pytest.mark.parametrize("out, rc, private", [
+    ("claude --session-id {sid} -p HOME=/u TMUX_PANE=%1", 0, False),
+    ("claude --session-id {sid} -p HOME=/u CLAUSTRUM_PRIVATE=1", 0, True),
+    ("claude --session-id {sid} -p HOME=/u WA_PRIVATE_SESSION=1", 0, True),
+    ("claude --session-id {sid} -p", 0, True),            # env unreadable: fail closed
+    ("", 1, True),
+])
+def test_claude_pid_session_privacy(monkeypatch, tmp_path, out, rc, private):
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _PS(out.format(sid=sid), rc))
+    assert cli._claude_pid_session(42)[1] is private
+    if private:
+        assert cli._find_claude_transcript_by_pid(42) is None
+
+
+def test_claude_pid_session_private_row(monkeypatch, tmp_path):
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    db = cli.get_db()
+    db.execute("INSERT INTO sessions (uid, status, last_seen, started_at, private) "
+               "VALUES (?, 'done', 0, 0, 1)", (sid,))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **k: _PS(f"claude --resume {sid} HOME=/u"))
+    assert cli._claude_pid_session(42) == (sid, True)
+
+
+def test_skill_does_not_repeat_a_name_only_pick(monkeypatch):
+    _wire_skill(monkeypatch, _row(topic="revenue-analysis", topic_confidence=60),
+                judge=lambda mode, cands: pytest.fail("judge must not be called"),
+                signal="SESSION NAME (hint only): revenue-dash")
+    with pytest.raises(cli.ClassifySkillNotReady):
+        cli.run_classification_skill("u")
+
+
 def test_rename_due_waits_for_volume_and_cooldown():
     now = 10_000
     assert cli._rename_due(0, 1199, 0, now, 0) is False
@@ -378,8 +422,16 @@ def test_resolve_checkin_uid():
     uid, note = cli._resolve_checkin_uid("artefact-inline-edit", env=env)
     assert uid == sid and "artefact-inline-edit" in note
     other = "11111111-2222-3333-4444-555555555555"
-    assert cli._resolve_checkin_uid(other, env=env) == (other, None)      # real uid honoured
-    assert cli._resolve_checkin_uid("named", env=env, known=True) == ("named", None)
+    # A brand-new UUID is honoured; one bound to another pane is someone else's.
+    assert cli._resolve_checkin_uid(other, env=env, pane="%1") == (other, None)
+    assert cli._resolve_checkin_uid(other, env=env, given_pane="%2", pane="%1")[0] == sid
+    # A stale invented id that already has a row (from a shared file) is replaced
+    # unless that row is bound to this very pane.
+    assert cli._resolve_checkin_uid("session-1-ab", env=env, given_pane="%2", pane="%1")[0] == sid
+    assert cli._resolve_checkin_uid("named", env=env, given_pane="%1", pane="%1") == ("named", None)
+    # An inherited session id whose row lives on another pane isn't ours.
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid(None, env=env, own_pane="%7", pane="%1")
     assert cli._resolve_checkin_uid("abc", env={}) == ("abc", None)
     with pytest.raises(ValueError):
         cli._resolve_checkin_uid(None, env={})
@@ -516,7 +568,7 @@ def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=(),
 
 def _row(**kw):
     base = {"uid": "u", "topic_confidence": 0, "transcript_path": None,
-            "cwd": None, "label": "L", "private": 0, "classify_locked": 0,
+            "cwd": None, "label": "L", "private": 0, "classify_locked": 0, "topic": None,
             "agent": "claude"}
     base.update(kw)
     return base
