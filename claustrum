@@ -1023,6 +1023,35 @@ def _overlap_gate_enabled():
     return os.environ.get("CLAUSTRUM_OVERLAP_GATE", "1").strip() not in ("0", "false", "off")
 
 
+_forced = None
+
+
+def _session_forced():
+    """A forced session edits through other sessions' file claims, holds none of
+    its own, and skips the overlap gate. It still publishes, so others see it.
+    Set per tmux pane (`tmux set -p @claustrum-force 1`, Conductor's force
+    toggle) so it can be flipped mid-session, or for a whole process tree with
+    CLAUSTRUM_FORCE=1. Cached: one hook process asks at most once."""
+    global _forced
+    if _forced is None:
+        _forced = os.environ.get("CLAUSTRUM_FORCE", "").strip() == "1" or _pane_forced()
+    return _forced
+
+
+def _pane_forced():
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return False
+    try:
+        out = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{@claustrum-force}"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.returncode == 0 and out.stdout.strip() == "1"
+
+
 def _normalize_rel_path(p):
     """Repo-relative dir/file prefix from a path or glob (mirrors the server's
     intents.normalize_path). None if nothing usable remains."""
@@ -1597,6 +1626,12 @@ def _overlap_gate(data):
         trigger = f"new branch {branch}" if branch else "new worktree"
         retry_scope = f"blocked:branch:{repo or '-'}:{branch or '-'}"
     else:
+        return
+
+    if _session_forced():
+        if tool_name == "ExitPlanMode":
+            plan = _plan_text(tool_input)
+            _spawn_plan_intent(uid, _plan_title(plan), _plan_paths(plan, _git_toplevel(target_dir)), repo, cwd)
         return
 
     db = get_db()
@@ -4367,6 +4402,14 @@ def hook_pre_tool(_args):
     now = time.time()
 
     _ensure_session(db, uid)
+
+    if _session_forced():
+        # Drop claims taken before the force was switched on, or they'd keep
+        # blocking sessions that still respect claims.
+        db.execute("DELETE FROM claims WHERE uid = ?", (uid,))
+        db.commit()
+        db.close()
+        return
 
     # Check for conflicting claim
     conflict = db.execute(
