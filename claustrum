@@ -1019,8 +1019,40 @@ _BRANCH_CMD_RE = re.compile(
 )
 
 
+def _conductor_disable_conflict_check():
+    """Check Conductor's user settings file for claustrumDisableConflictCheck."""
+    try:
+        state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+        settings_path = os.path.join(state_home, "wa", "conductor-settings.json")
+        if os.path.isfile(settings_path):
+            with open(settings_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("claustrumDisableConflictCheck") is True:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _conflict_check_enabled():
+    """Whether active session conflict checks (file claims and overlap gates) are enabled.
+    Can be explicitly disabled via CLAUSTRUM_CONFLICT_CHECK=0/false/off/no or
+    via Conductor's claustrumDisableConflictCheck setting."""
+    env = os.environ.get("CLAUSTRUM_CONFLICT_CHECK")
+    if env is not None:
+        return env.strip().lower() not in ("0", "false", "off", "no")
+    if _conductor_disable_conflict_check():
+        return False
+    return True
+
+
 def _overlap_gate_enabled():
-    return os.environ.get("CLAUSTRUM_OVERLAP_GATE", "1").strip() not in ("0", "false", "off")
+    overlap_env = os.environ.get("CLAUSTRUM_OVERLAP_GATE")
+    if overlap_env is not None:
+        return overlap_env.strip().lower() not in ("0", "false", "off", "no")
+    if not _conflict_check_enabled():
+        return False
+    return True
 
 
 def _normalize_rel_path(p):
@@ -4369,27 +4401,28 @@ def hook_pre_tool(_args):
     _ensure_session(db, uid)
 
     # Check for conflicting claim
-    conflict = db.execute(
-        """
-        SELECT c.uid, s.task FROM claims c
-        JOIN sessions s ON c.uid = s.uid
-        WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
-        """,
-        (filepath, uid),
-    ).fetchone()
+    if _conflict_check_enabled():
+        conflict = db.execute(
+            """
+            SELECT c.uid, s.task FROM claims c
+            JOIN sessions s ON c.uid = s.uid
+            WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
+            """,
+            (filepath, uid),
+        ).fetchone()
 
-    if conflict:
-        db.close()
-        task_info = f" (task: {conflict['task']})" if conflict["task"] else ""
-        print(
-            f"Claustrum: {filepath} is claimed by session "
-            f"{conflict['uid'][:12]}{task_info}. "
-            f"Coordinate before editing. Use: "
-            f"claustrum send --uid <your-uid> --to {conflict['uid']} "
-            f'--body "requesting access to {os.path.basename(filepath)}"',
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        if conflict:
+            db.close()
+            task_info = f" (task: {conflict['task']})" if conflict["task"] else ""
+            print(
+                f"Claustrum: {filepath} is claimed by session "
+                f"{conflict['uid'][:12]}{task_info}. "
+                f"Coordinate before editing. Use: "
+                f"claustrum send --uid <your-uid> --to {conflict['uid']} "
+                f'--body "requesting access to {os.path.basename(filepath)}"',
+                file=sys.stderr,
+            )
+            sys.exit(2)
 
     # Claim the file
     db.execute(
@@ -5607,24 +5640,25 @@ def cmd_claim(args):
     db = get_db()
     now = time.time()
 
-    conflict = db.execute(
-        """
-        SELECT c.uid, s.task FROM claims c
-        JOIN sessions s ON c.uid = s.uid
-        WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
-        """,
-        (args.file, args.uid),
-    ).fetchone()
+    if not getattr(args, "force", False) and _conflict_check_enabled():
+        conflict = db.execute(
+            """
+            SELECT c.uid, s.task FROM claims c
+            JOIN sessions s ON c.uid = s.uid
+            WHERE c.filepath = ? AND c.uid != ? AND s.status = 'active'
+            """,
+            (args.file, args.uid),
+        ).fetchone()
 
-    if conflict:
-        db.close()
-        task_info = f" ({conflict['task']})" if conflict["task"] else ""
-        print(
-            f"CONFLICT: {args.file} claimed by "
-            f"{conflict['uid'][:12]}{task_info}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if conflict:
+            db.close()
+            task_info = f" ({conflict['task']})" if conflict["task"] else ""
+            print(
+                f"CONFLICT: {args.file} claimed by "
+                f"{conflict['uid'][:12]}{task_info}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     db.execute(
         "INSERT OR REPLACE INTO claims (filepath, uid, claimed_at) VALUES (?,?,?)",
@@ -6408,6 +6442,7 @@ def main():
     p = sub.add_parser("claim", help="Claim a file")
     p.add_argument("--uid", required=True)
     p.add_argument("--file", required=True)
+    p.add_argument("--force", action="store_true", help="Force claim even if conflicting")
 
     # -- release --
     p = sub.add_parser("release", help="Release a file claim")
