@@ -1309,3 +1309,12 @@ def test_render_related_tier():
         ]},
     })
     assert any("2 session(s) on related topics" in l and "artefacts-reviews" in l for l in lines)
+
+
+def test_find_transcript_claude_placeholder_resolves_by_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    found = str(tmp_path / "real-session.jsonl")
+    monkeypatch.setattr(cli, "_find_claude_transcript_by_pid", lambda pid: found if pid == 42 else None)
+    assert cli._find_transcript("tmux-h-%1-42", agent="claude", pid=42) == (found, "claude")
+    assert cli._find_transcript("tmux-h-%1-43", agent="claude", pid=43) == (None, None)

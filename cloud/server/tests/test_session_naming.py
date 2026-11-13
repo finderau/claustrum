@@ -224,3 +224,24 @@ def test_refine_counts_attempts(env):
     n = db.execute("SELECT name_attempts FROM sessions WHERE uid = 'u1'").fetchone()[0]
     db.close()
     assert n == 1
+
+
+def test_refine_skips_rename_when_renamed_during_judge(env, monkeypatch):
+    def judge(mode, signal, cands):
+        env["live"] = "hand-picked-name"
+        return {"choice": "claustrum-session-naming", "is_new": True, "description": ""}
+    monkeypatch.setattr(cli, "_judge_with_retries", judge)
+    assert cli._refine_auto_name("u1") is None
+    assert env["renamed_to"] is None
+
+
+def test_refine_keeps_auto_label_when_tmux_refuses(env, monkeypatch):
+    real = cli.subprocess.run
+
+    def refuse(cmd, **kw):
+        if cmd[:2] == ["tmux", "rename-session"]:
+            return _Proc(returncode=1)
+        return real(cmd, **kw)
+    monkeypatch.setattr(cli.subprocess, "run", refuse)
+    assert cli._refine_auto_name("u1") is None
+    assert _row()["auto_label"] == "yo-still-think-have"
