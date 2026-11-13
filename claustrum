@@ -4885,16 +4885,17 @@ def _resolve_checkin_uid(given, env=None, pane_uid=None, given_pane=None, own_pa
     env = os.environ if env is None else env
     own = env.get("CLAUDE_CODE_SESSION_ID")
     if own:
+        if given is not None and given != own:
+            mine = given_pane is not None and (not given_pane or given_pane == pane)
+            fresh_uuid = given_pane is None and bool(_UUID_RE.fullmatch(given))
+            if mine or fresh_uuid:
+                return given, None
         if pane and own_pane and own_pane != pane:
             raise ValueError(
                 f"CLAUDE_CODE_SESSION_ID {own} belongs to another pane ({own_pane}); "
                 f"pass this process's own --uid")
         if given is None or given == own:
             return own, None
-        mine = given_pane is not None and (not given_pane or given_pane == pane)
-        fresh_uuid = given_pane is None and bool(_UUID_RE.fullmatch(given))
-        if mine or fresh_uuid:
-            return given, None
         return own, f"ignoring --uid {given}: this session is {own}"
     if not given:
         raise ValueError("--uid is required outside Claude Code")
@@ -5241,7 +5242,9 @@ def cmd_heartbeat(args):
                     (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath, pane_private),
                 )
                 _retire_pane_predecessors(db, uid, host, boot, pane)
-                adopted.append((uid, label, now))
+                row_private = db.execute(
+                    "SELECT private FROM sessions WHERE uid = ?", (uid,)).fetchone()[0]
+                adopted.append((uid, label, now, bool(row_private)))
         db.commit()
 
     # DEDUP to one active row per pane (full run): a reused pane, or a
@@ -5344,7 +5347,9 @@ def cmd_heartbeat(args):
         if _refresh_checkin(uid, label, task=task, cwd=cwd, started_at=started_at):
             cloud_successes += 1
     # Adopted orphan panes: same path so they appear AND get classified.
-    for uid, label, started_at in adopted:
+    for uid, label, started_at, private in adopted:
+        if private:
+            continue
         cloud_attempts += 1
         if _refresh_checkin(uid, label, started_at=started_at):
             cloud_successes += 1

@@ -432,6 +432,13 @@ def test_resolve_checkin_uid():
     # An inherited session id whose row lives on another pane isn't ours.
     with pytest.raises(ValueError):
         cli._resolve_checkin_uid(None, env=env, own_pane="%7", pane="%1")
+    # ...but an explicit uid that is fresh or bound to this pane still resolves,
+    # and an unbound invented one never falls back to the foreign inherited id.
+    assert cli._resolve_checkin_uid(other, env=env, own_pane="%7", pane="%1") == (other, None)
+    assert cli._resolve_checkin_uid("named", env=env, given_pane="%1", own_pane="%7",
+                                    pane="%1") == ("named", None)
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid("named", env=env, given_pane="%2", own_pane="%7", pane="%1")
     assert cli._resolve_checkin_uid("abc", env={}) == ("abc", None)
     with pytest.raises(ValueError):
         cli._resolve_checkin_uid(None, env={})
