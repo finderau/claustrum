@@ -117,8 +117,14 @@ claustrum status
 # `claustrum show <name>` hint points at.
 claustrum show api-tests
 
-# Manually register your session's task (Claude can do this via Bash)
-claustrum checkin --uid <session-id> --task "refactoring auth"
+# Manually register your session's task. Rarely needed: the prompt hook already
+# registers every session. Inside Claude Code --uid defaults to the harness
+# session id, which replaces any uid not already bound to this pane (a brand-new
+# UUID excepted); elsewhere a uid other than the pane's registered one is refused.
+claustrum checkin --task "refactoring auth"
+
+# Rename this session's board name (its tmux session). Overrides the auto name.
+claustrum rename user-editable-artefacts
 
 # Update what you're working on (also feeds the cloud detail layer)
 claustrum update --uid <session-id> --files "src/auth/*.ts"
@@ -409,7 +415,19 @@ topic+domain stop moving — drift re-verify, cloud checkin mirrors and pane
 carry-forward all leave a locked session alone, so a session doesn't wander
 between collections mid-conversation. The lock is set only by a confident,
 transcript-based skill pick or a deliberate `classify-self` — never by an
-inherited or cloud-supplied value. If a locked classification is wrong,
+inherited or cloud-supplied value. A pick made from a session **name alone** (an
+adopted pane with no transcript) is written at `CLASSIFY_LABEL_ONLY_CONF`, below
+the floor and unlocked, and is replaced once a transcript has volume. Adopted
+Claude panes resolve their transcript from the `--session-id`/`--resume` in the
+process argv, so a Conductor launch classifies from the conversation, not its
+name. A process running under `CLAUSTRUM_PRIVATE`/`WA_PRIVATE_SESSION`, whose
+session row is private, or whose environment can't be read is marked private
+and its transcript is never resolved. An auto placeholder name (the first-prompt keyword skim) never counts as
+a descriptive name, on any row of its pane; the heartbeat replaces it with an
+LLM-written name once the transcript clears `CLASSIFY_MIN_CHARS` (typically the
+first full reply), whether or not the session is already classified. A name set
+by hand (`claustrum rename`, `tmux rename-session`) is never overwritten. If a
+locked classification is wrong,
 `claustrum reclassify <session-id>` clears the lock so it re-classifies from the
 current transcript on the next cycle.
 

@@ -340,6 +340,112 @@ def test_tick_classify_covers_settled_placeholder():
     assert cli._tick_classify_covers(0, "claude", real, age_seconds=settle, label=label) is False
 
 
+def test_tick_classify_covers_placeholder_with_transcript_and_topic():
+    pane = "tmux-host-%23-4242"
+    settle = cli.PLACEHOLDER_SETTLE_SECONDS
+    # A settled placeholder already guessed from its name doesn't re-guess every
+    # cooldown...
+    assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle,
+                                     label="know-love-ability-click", has_topic=True) is False
+    # ...but does reclassify once its argv-resolved transcript has volume.
+    assert cli._tick_classify_covers(0, "claude", pane, age_seconds=settle,
+                                     transcript_chars=1200, has_topic=True) is True
+
+
+def test_claude_session_id_from_cmd():
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    assert cli._claude_session_id_from_cmd(f"/x/claude --session-id {sid} -p") == sid
+    assert cli._claude_session_id_from_cmd(f"claude --resume={sid}") == sid
+    assert cli._claude_session_id_from_cmd(f"claude -r {sid}") == sid
+    assert cli._claude_session_id_from_cmd("claude --verbose") is None
+    assert cli._claude_session_id_from_cmd(f"claude --resume {sid} --fork-session") is None
+
+
+class _PS:
+    def __init__(self, out, rc=0):
+        self.stdout, self.returncode = out, rc
+
+
+@pytest.mark.parametrize("out, rc, private", [
+    ("claude --session-id {sid} -p HOME=/u TMUX_PANE=%1", 0, False),
+    ("claude --session-id {sid} -p HOME=/u CLAUSTRUM_PRIVATE=1", 0, True),
+    ("claude --session-id {sid} -p HOME=/u WA_PRIVATE_SESSION=1", 0, True),
+    ("claude --session-id {sid} -p", 0, True),            # env unreadable: fail closed
+    ("", 1, True),
+])
+def test_claude_pid_session_privacy(monkeypatch, tmp_path, out, rc, private):
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _PS(out.format(sid=sid), rc))
+    assert cli._claude_pid_session(42)[1] is private
+    if private:
+        assert cli._find_claude_transcript_by_pid(42) is None
+
+
+def test_claude_pid_session_private_row(monkeypatch, tmp_path):
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    db = cli.get_db()
+    db.execute("INSERT INTO sessions (uid, status, last_seen, started_at, private) "
+               "VALUES (?, 'done', 0, 0, 1)", (sid,))
+    db.commit()
+    db.close()
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **k: _PS(f"claude --resume {sid} HOME=/u"))
+    assert cli._claude_pid_session(42) == (sid, True)
+
+
+def test_skill_does_not_repeat_a_name_only_pick(monkeypatch):
+    _wire_skill(monkeypatch, _row(topic="revenue-analysis", topic_confidence=60),
+                judge=lambda mode, cands: pytest.fail("judge must not be called"),
+                signal="SESSION NAME (hint only): revenue-dash")
+    with pytest.raises(cli.ClassifySkillNotReady):
+        cli.run_classification_skill("u")
+
+
+def test_rename_due_waits_for_volume_and_cooldown():
+    now = 10_000
+    assert cli._rename_due(0, 1199, 0, now, 0) is False
+    assert cli._rename_due(0, 1200, 0, now, 0) is True
+    assert cli._rename_due(20, 0, 0, now, 0) is True
+    assert cli._rename_due(0, 5000, now - 1, now, 0) is False     # cooling down
+    assert cli._rename_due(0, 5000, 0, now, 1) is False           # private
+    assert cli._rename_due(0, 5000, 0, now, 0, attempts=cli.NAME_REFINE_ATTEMPTS) is False
+
+
+def test_resolve_checkin_uid():
+    sid = "697dd496-3893-4f8e-8d90-2b3214723a9d"
+    env = {"CLAUDE_CODE_SESSION_ID": sid}
+    assert cli._resolve_checkin_uid(None, env=env) == (sid, None)
+    uid, note = cli._resolve_checkin_uid("artefact-inline-edit", env=env)
+    assert uid == sid and "artefact-inline-edit" in note
+    other = "11111111-2222-3333-4444-555555555555"
+    # A brand-new UUID is honoured; one bound to another pane is someone else's.
+    assert cli._resolve_checkin_uid(other, env=env, pane="%1") == (other, None)
+    assert cli._resolve_checkin_uid(other, env=env, given_pane="%2", pane="%1")[0] == sid
+    # A stale invented id that already has a row (from a shared file) is replaced
+    # unless that row is bound to this very pane.
+    assert cli._resolve_checkin_uid("session-1-ab", env=env, given_pane="%2", pane="%1")[0] == sid
+    assert cli._resolve_checkin_uid("named", env=env, given_pane="%1", pane="%1") == ("named", None)
+    # An inherited session id whose row lives on another pane isn't ours.
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid(None, env=env, own_pane="%7", pane="%1")
+    # ...but an explicit uid that is fresh or bound to this pane still resolves,
+    # and an unbound invented one never falls back to the foreign inherited id.
+    assert cli._resolve_checkin_uid(other, env=env, own_pane="%7", pane="%1") == (other, None)
+    assert cli._resolve_checkin_uid("named", env=env, given_pane="%1", own_pane="%7",
+                                    pane="%1") == ("named", None)
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid("named", env=env, given_pane="%2", own_pane="%7", pane="%1")
+    assert cli._resolve_checkin_uid("abc", env={}) == ("abc", None)
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid(None, env={})
+    with pytest.raises(ValueError):
+        cli._resolve_checkin_uid("artefact-inline-edit", env={}, pane_uid="real-uid")
+
+
 def test_tick_classify_covers_volume_threshold():
     claude = "3f2a1b8c-0000-4000-8000-000000000000"  # real hook uid
     pane = "tmux-host-%23"                            # adopted pane uid
@@ -447,10 +553,11 @@ class _FakeDB:
         pass
 
 
-def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=()):
+def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=(),
+                signal="SIGNAL\n\n" + cli._TRANSCRIPT_MARK + "\nuser: work"):
     monkeypatch.setenv("CLAUSTRUM_CLASSIFY_CMD", "stub")
     monkeypatch.setattr(cli, "get_db", lambda: _FakeDB(row))
-    monkeypatch.setattr(cli, "_classify_signal", lambda r: "SIGNAL")
+    monkeypatch.setattr(cli, "_classify_signal", lambda r: signal)
     monkeypatch.setattr(cli, "_cloud_domains",
                         lambda **k: [{"name": n, "description": n} for n in dom_names])
     monkeypatch.setattr(cli, "_cloud_topics", lambda **k: list(topics))
@@ -468,7 +575,7 @@ def _wire_skill(monkeypatch, row, judge, dom_names=("data",), topics=()):
 
 def _row(**kw):
     base = {"uid": "u", "topic_confidence": 0, "transcript_path": None,
-            "cwd": None, "label": "L", "private": 0, "classify_locked": 0,
+            "cwd": None, "label": "L", "private": 0, "classify_locked": 0, "topic": None,
             "agent": "claude"}
     base.update(kw)
     return base
@@ -487,6 +594,25 @@ def test_skill_picks_existing_domain_and_topic(monkeypatch):
     assert calls["propose_domain"] == [] and calls["propose_topic"] == []  # match-first: nothing minted
     uid, ctopic, cdomain, conf = calls["classify_self"]
     assert cdomain == "data" and conf == cli.CLASSIFY_SKILL_CONF
+
+
+def test_skill_name_only_pick_is_low_confidence_and_unlocked(monkeypatch):
+    # A pick with no transcript behind it (adopted pane, name only) must not be
+    # final: below the floor and unlocked so the tick replaces it once the
+    # transcript exists.
+    calls = _wire_skill(
+        monkeypatch, _row(),
+        judge=lambda mode, cands: {"choice": "data" if mode == "domain" else "revenue-analysis",
+                                   "is_new": False, "description": ""},
+        topics=[{"name": "revenue-analysis", "domain": "data", "description": "t"}],
+        signal="SESSION NAME (hint only): revenue-dash",
+    )
+    locks = []
+    monkeypatch.setattr(cli, "_set_local_topic",
+                        lambda db, uid, topic, conf, domain=None, lock=False: locks.append((conf, lock)))
+    cli.run_classification_skill("u")
+    assert calls["classify_self"][3] == cli.CLASSIFY_LABEL_ONLY_CONF < cli.CLASSIFY_CONF_FLOOR
+    assert locks == [(cli.CLASSIFY_LABEL_ONLY_CONF, False)]
 
 
 def test_skill_mints_new_domain_then_topic(monkeypatch):
@@ -1242,3 +1368,12 @@ def test_render_related_tier():
         ]},
     })
     assert any("2 session(s) on related topics" in l and "artefacts-reviews" in l for l in lines)
+
+
+def test_find_transcript_claude_placeholder_resolves_by_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    found = str(tmp_path / "real-session.jsonl")
+    monkeypatch.setattr(cli, "_find_claude_transcript_by_pid", lambda pid: found if pid == 42 else None)
+    assert cli._find_transcript("tmux-h-%1-42", agent="claude", pid=42) == (found, "claude")
+    assert cli._find_transcript("tmux-h-%1-43", agent="claude", pid=43) == (None, None)

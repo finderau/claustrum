@@ -162,3 +162,96 @@ def test_refine_failure_does_not_spend_a_classify_attempt(env, monkeypatch):
     finally:
         db.close()
     assert not r["classify_attempts"] and not r["classify_failed"]
+
+
+def test_refine_finds_placeholder_via_pane(env):
+    # The adopted placeholder (no auto_label of its own) is the row that got
+    # classified; the hook row on the same pane holds the auto name.
+    db = cli.get_db()
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, task, status, last_seen, started_at) "
+        "VALUES ('tmux-h-%9-1', 'yo-still-think-have', '%9', 'naming sessions', 'active', 0, 0)")
+    db.commit()
+    db.close()
+    assert cli._refine_auto_name("tmux-h-%9-1") == "claustrum-session-naming"
+    assert _row()["auto_label"] is None      # cleared pane-wide, never fires twice
+
+
+def test_placeholder_auto_name_does_not_lead_signal(env):
+    db = cli.get_db()
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, status, last_seen, started_at, agent) "
+        "VALUES ('tmux-h-%9-1', 'yo-still-think-have', '%9', 'active', 0, 0, 'claude')")
+    db.commit()
+    row = db.execute("SELECT * FROM sessions WHERE uid = 'tmux-h-%9-1'").fetchone()
+    db.close()
+    assert "SESSION NAME" not in cli._classify_signal(row)
+
+
+@pytest.mark.parametrize("locked, expect_conf", [
+    (0, cli.CLASSIFY_LABEL_ONLY_CONF),   # name-only guess: capped below the floor
+    (1, 75),                             # transcript-grounded: kept, so no re-wander
+])
+def test_placeholder_carry_forward(env, locked, expect_conf):
+    db = cli.get_db()
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, host, boot_id, status, last_seen, "
+        "started_at, domain, topic, topic_confidence, classify_locked) VALUES "
+        "('tmux-h-%5-1', 'same-task', '%5', 'h', 'b', 'active', 0, 0, 'wa', 'conductor', 75, ?)",
+        (locked,))
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, host, boot_id, status, last_seen, started_at) "
+        "VALUES ('real', 'same-task', '%5', 'h', 'b', 'active', 1, 1)")
+    cli._retire_pane_predecessors(db, "real", "h", "b", "%5")
+    r = db.execute("SELECT topic, topic_confidence, classify_locked FROM sessions "
+                   "WHERE uid = 'real'").fetchone()
+    db.close()
+    assert r["topic"] == "conductor"
+    assert r["topic_confidence"] == expect_conf and not r["classify_locked"]
+
+
+def test_refine_judge_agreeing_with_placeholder_ends_refine(env):
+    env["judge"] = "yo-still-think-have"
+    assert cli._refine_auto_name("u1") is None
+    assert env["renamed_to"] is None
+    assert _row()["auto_label"] is None
+
+
+def test_refine_counts_attempts(env):
+    env["judge"] = "naming"
+    cli._refine_auto_name("u1")
+    db = cli.get_db()
+    n = db.execute("SELECT name_attempts FROM sessions WHERE uid = 'u1'").fetchone()[0]
+    db.close()
+    assert n == 1
+
+
+def test_refine_skips_rename_when_renamed_during_judge(env, monkeypatch):
+    def judge(mode, signal, cands):
+        env["live"] = "hand-picked-name"
+        return {"choice": "claustrum-session-naming", "is_new": True, "description": ""}
+    monkeypatch.setattr(cli, "_judge_with_retries", judge)
+    assert cli._refine_auto_name("u1") is None
+    assert env["renamed_to"] is None
+
+
+def test_refine_keeps_auto_label_when_tmux_refuses(env, monkeypatch):
+    real = cli.subprocess.run
+
+    def refuse(cmd, **kw):
+        if cmd[:2] == ["tmux", "rename-session"]:
+            return _Proc(returncode=1)
+        return real(cmd, **kw)
+    monkeypatch.setattr(cli.subprocess, "run", refuse)
+    assert cli._refine_auto_name("u1") is None
+    assert _row()["auto_label"] == "yo-still-think-have"
+
+
+def test_refine_keeps_auto_label_when_live_name_unreadable(env, monkeypatch):
+    def fail(cmd, **_):
+        if cmd[:2] == ["tmux", "display-message"]:
+            return _Proc(returncode=1)
+        raise AssertionError(cmd)
+    monkeypatch.setattr(cli.subprocess, "run", fail)
+    assert cli._refine_auto_name("u1") is None
+    assert _row()["auto_label"] == "yo-still-think-have"
