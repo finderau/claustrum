@@ -551,9 +551,12 @@ close that gap:
   context; nothing forced a human to see it. Now, when a session commits to
   work — its first Edit/Write/MultiEdit per repo+branch, `ExitPlanMode`, or
   `git checkout -b` / `git switch -c` / `git worktree add` — the PreToolUse hook
-  combines live peers (t1–t3 and any related tier), matching intents, matching
-  open PRs and recent (30-day) file/dir-matching solved work. If anything is
-  new for this session it blocks **once** with exit 2:
+  combines what shares code with this session: live t1/t2 peers (same repo and
+  a common file, directory or PR), intents sharing a directory, matching open
+  PRs and recent (30-day) file/dir-matching solved work. Topic and
+  related-topic matches (t3/t3b) span repos, so they stay in the per-turn tray
+  and never block. If anything is new for this session it blocks **once** with
+  exit 2:
 
   ```
   Claustrum overlap check (first edit on feat/x) — other work overlaps what this session is about to start:

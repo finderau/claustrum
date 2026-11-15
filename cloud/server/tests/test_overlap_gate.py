@@ -258,7 +258,9 @@ def test_overlap_items_weak_and_stale_signals_ignored():
                          "peers": [{"uid": "t3", "user_email": "a@f", "topic": "artefacts"}]},
             "t4_repo": {"repo": "wa", "count": 1, "peers": [{"uid": "t4", "user_email": "b@f"}]},
             "t3b_related": [{"uid": "rel", "user_email": "c@f", "reason": "domain:tooling"}],
+            "t2_path_or_pr": [{"uid": "t2", "user_email": "d@f", "reason": "dir artefacts/"}],
         },
+        "intents": [dict(INTENT, id=13, match="topic", topic="artefacts")],
         "solved": [
             {"uid": "s-new", "person": "k@f", "match_tier": "t2_path_or_pr",
              "resolution": "shipped", "done_at": now.isoformat()},
@@ -269,7 +271,9 @@ def test_overlap_items_weak_and_stale_signals_ignored():
         ],
     }
     keys = [k for k, _ in m._overlap_items(resp, None)]
-    assert keys == ["peer:t3", "peer:rel", "solved:s-new"]
+    assert keys == ["peer:t2", "solved:s-new"]
+    tray = [k for k, _ in m._overlap_items(resp, None, code_only=False)]
+    assert tray == ["peer:t2", "intent:13", "solved:s-new"]
 
 
 # --- open PRs ----------------------------------------------------------------
@@ -428,9 +432,11 @@ def test_retry_after_plan_or_branch_block_never_blocks_again(gate, capsys):
     branch = {"session_id": "me-r", "tool_name": "Bash", "cwd": str(st["root"]),
               "tool_input": {"command": "git checkout -b feat/q"}}
     st["list"] = {"tiers": {"t3_topic": [dict(T1_PEER, uid="topic-1")]}}
+    assert _run(m, branch, capsys) == (False, "")
+    st["list"] = {"tiers": {"t2_path_or_pr": [dict(T1_PEER, uid="dir-1")]}}
     assert _run(m, branch, capsys)[0]
-    st["list"] = {"tiers": {"t3_topic": [dict(T1_PEER, uid="topic-1"),
-                                         dict(T1_PEER, uid="topic-2")]}}
+    st["list"] = {"tiers": {"t2_path_or_pr": [dict(T1_PEER, uid="dir-1"),
+                                              dict(T1_PEER, uid="dir-2")]}}
     assert _run(m, branch, capsys) == (False, "")
 
 

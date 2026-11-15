@@ -1450,17 +1450,23 @@ def _peer_line(p, where):
     return f"Live: {who} ({p.get('machine', '?')}) {where} — {on}"
 
 
-def _overlap_items(list_resp, pr_matches):
+# Tiers that mean shared code (same repo and a common file, directory or PR).
+# Topic and related-topic tiers match across repos, so two people in the same
+# domain doing unrelated work would block each other; those stay in the tray.
+_GATE_PEER_TIERS = ("t1_file_overlap", "t2_path_or_pr")
+
+
+def _overlap_items(list_resp, pr_matches, code_only=True):
     """Flatten everything material into (key, line) pairs. Keys identify the
     overlapping thing (not the moment) so a set already shown never re-blocks.
-    Live t1/t2/t3 peers plus any extra non-repo tier, matching intents, other
-    people's open PRs, and recent strongly-matching solved work. The t4
-    same-repo tier is too weak to interrupt anyone for."""
+    Live t1/t2 peers, path-matching intents, other people's open PRs, and
+    recent file/dir-matching solved work. `code_only=False` also keeps
+    topic-matched intents, for the quiet per-turn tray."""
     items = []
     resp = list_resp if isinstance(list_resp, dict) else {}
     tiers = resp.get("tiers") if isinstance(resp.get("tiers"), dict) else {}
     for name, tier in tiers.items():
-        if name == "t4_repo":
+        if name not in _GATE_PEER_TIERS:
             continue
         peers = tier.get("peers") if isinstance(tier, dict) else tier
         for p in peers or []:
@@ -1468,16 +1474,14 @@ def _overlap_items(list_resp, pr_matches):
                 continue
             if name == "t1_file_overlap":
                 where = "editing " + (", ".join(p.get("overlap_files") or []) or "your files")
-            elif name == "t2_path_or_pr":
-                where = f"same {p.get('reason') or 'PR/dir'}"
-            elif name == "t3_topic":
-                where = f"on topic '{p.get('topic') or '?'}'"
             else:
-                where = f"related ({p.get('reason') or p.get('topic') or name})"
+                where = f"same {p.get('reason') or 'PR/dir'}"
             items.append((f"peer:{p['uid']}", _peer_line(p, where)))
 
     for it in resp.get("intents") or []:
         if not isinstance(it, dict) or it.get("id") is None:
+            continue
+        if code_only and it.get("match") != "path":
             continue
         who = _short_email(it.get("person"))
         if it.get("match") == "path":
@@ -1707,7 +1711,7 @@ def _overlap_gate(data):
 def _render_intents(intents):
     """Per-turn tray lines for matching planned work (quiet, one line each)."""
     lines = []
-    for _key, line in _overlap_items({"intents": intents or []}, None)[:3]:
+    for _key, line in _overlap_items({"intents": intents or []}, None, code_only=False)[:3]:
         lines.append(f"      • {line[len('Planned: '):]}")
     if lines:
         lines.insert(0, "  \U0001f4dd Planned work overlapping yours (claustrum intents):")
