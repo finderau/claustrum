@@ -40,6 +40,7 @@ ABANDONED_ACTIVE_HOURS = 24       # active -> paused after this long with no pro
 CONCENTRATION_THRESHOLD = 3       # >= this many active sessions on one topic -> alert
 CONCENTRATION_REALERT_MINUTES = 60  # don't re-alert the same topic within this window
 INTENT_RETENTION_DAYS = 90        # closed / lapsed intents are deleted after this
+WORK_START_RETENTION_DAYS = 7      # opening fingerprints have a short local/cloud window
 DONE_ARCHIVE_DAYS = 180           # done rows older than this -> cold archive table
 PAUSED_ARCHIVE_DAYS = 1           # dead/idle paused rows -> cold archive after a day (status kept)
 
@@ -356,6 +357,17 @@ async def state_transitions():
             except psycopg.errors.UndefinedTable:
                 pass
 
+            purged_work_starts = 0
+            try:
+                async with c.transaction():
+                    await cur.execute(
+                        "DELETE FROM work_starts WHERE first_at < now() - make_interval(days => %s)",
+                        (WORK_START_RETENTION_DAYS,),
+                    )
+                    purged_work_starts = cur.rowcount
+            except psycopg.errors.UndefinedTable:
+                pass
+
         await c.commit()
 
     return {
@@ -363,6 +375,7 @@ async def state_transitions():
         "paused": paused,
         "expired_claims": expired_claims,
         "purged_intents": purged_intents,
+        "purged_work_starts": purged_work_starts,
         "stale_active_minutes": STALE_ACTIVE_MINUTES,
         "abandoned_active_hours": ABANDONED_ACTIVE_HOURS,
     }

@@ -55,6 +55,16 @@ async def reset(user_email: str = Depends(current_user)):
             except psycopg.errors.UndefinedTable:
                 pass
 
+            work_starts_deleted = 0
+            try:
+                async with c.transaction():
+                    await cur.execute(
+                        "DELETE FROM work_starts WHERE user_email = %(e)s", {"e": user_email}
+                    )
+                    work_starts_deleted = cur.rowcount
+            except psycopg.errors.UndefinedTable:
+                pass
+
             # Delete sessions last — the uid list above is derived from it.
             await cur.execute(
                 "DELETE FROM sessions WHERE user_email = %(e)s", {"e": user_email}
@@ -71,5 +81,6 @@ async def reset(user_email: str = Depends(current_user)):
             "claims": claims_deleted,
             "topic_proposals": proposals_deleted,
             "intents": intents_deleted,
+            "work_starts": work_starts_deleted,
         },
     }

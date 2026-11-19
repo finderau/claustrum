@@ -20,6 +20,7 @@ from app.routes import (
     topics,
     ui,
     update,
+    work_starts,
 )
 
 
@@ -40,6 +41,7 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(checkin.router, prefix="/v1")
 app.include_router(update.router, prefix="/v1")
+app.include_router(work_starts.router, prefix="/v1")
 app.include_router(list_peers.router, prefix="/v1")
 app.include_router(claim.router, prefix="/v1")
 app.include_router(classify.router, prefix="/v1")

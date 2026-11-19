@@ -25,7 +25,7 @@ Claude doesn't *decide* to coordinate. It just *perceives* the coordination stat
 User hits Enter
        │
        ▼
-UserPromptSubmit hook fires   (local-only — never blocks on the network)
+UserPromptSubmit hook fires   (local; one cloud call on a substantial opening brief)
        │
        ├──→ One-time duplicate-brief check (may stop a repeated opening prompt)
        ├──→ Heartbeat (I'm alive)
@@ -58,19 +58,24 @@ The backing store is a single SQLite file (`~/.claustrum/state.db`) in WAL mode.
 
 ### Duplicate opening briefs
 
-Claustrum keeps a local, seven-day record of each session's first substantial
-prompt. A new session with the same prompt, or the same Markdown plan path and
-branch named in its prompt, stops once at `UserPromptSubmit` and shows the earlier
-session. This catches a repeated seed even when the first session has exited,
-its live row has been reaped, its topic differs, or both sessions use the same
-worktree and PR. After reviewing the earlier session and its PR, resend the prompt
-to continue an intentional handoff. `CLAUSTRUM_DUPLICATE_WORK=0` disables this
+Claustrum keeps a seven-day record of each session's first substantial prompt.
+A new session with the same prompt, or the same Markdown plan and branch named
+in its prompt, stops once at `UserPromptSubmit` and shows the earlier session.
+This catches a repeated seed even when the first session has exited, its live
+row has been reaped, its topic differs, or both sessions use the same worktree
+and PR. After reviewing the earlier session and its PR, resend the prompt to
+continue an intentional handoff. `CLAUSTRUM_DUPLICATE_WORK=0` disables this
 check.
 
-Only a hash of the prompt, the plan path, branch, session label and timestamp are
-kept locally; prompt text is not stored. Private briefs match only other private
-briefs, and no duplicate-brief data is sent to the cloud. Sessions started before
-this check was installed have no opening-brief record.
+The local SQLite record contains a prompt hash, plan path, branch, label and
+timestamp. Public sessions also send the opaque prompt hash and a hash of the
+canonical repo, repo-relative plan path and branch to Claustrum Cloud. No prompt
+text or absolute path is sent. Cloud compares briefs across all authenticated
+users, regardless of machine or topic. Private sessions never call this endpoint
+or appear in company matches. If Cloud is unavailable, the local check still
+runs and the prompt continues. Cloud is contacted only on a new substantial
+opening brief or its deliberate retry, not on every turn. Sessions started
+before this check was installed have no opening-brief record.
 
 ## Quick Start
 

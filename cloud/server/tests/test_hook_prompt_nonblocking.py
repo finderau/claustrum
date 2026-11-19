@@ -10,7 +10,8 @@ only and spawns a detached `cloud-sync` worker; it renders cross-machine state
 from that worker's last result (the cloud cache).
 
 Invariants under test:
-  1. `hook_prompt` performs ZERO cloud I/O (all of it moved to `cmd_cloud_sync`).
+  1. Routine prompts perform zero cloud I/O. A substantial opening brief has
+     one bounded duplicate-work request; other cloud work stays in `cmd_cloud_sync`.
   2. `hook_prompt` always spawns exactly one detached cloud-sync.
   3. `cmd_cloud_sync` writes the cache the hook renders from.
   4. A sync's cross-machine inbox is shown exactly once (tracked by synced_at

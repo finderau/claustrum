@@ -39,6 +39,31 @@ class CheckinResponse(BaseModel):
     first_turn_message: str | None = None
 
 
+class WorkStartRequest(BaseModel):
+    uid: str = Field(min_length=1, max_length=128)
+    machine: str = Field(min_length=1, max_length=128)
+    label: str | None = Field(default=None, max_length=128)
+    prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_key: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    repo: str | None = Field(default=None, max_length=128)
+    branch: str | None = Field(default=None, max_length=256)
+    acknowledge: bool = False
+
+
+class WorkStartMatch(BaseModel):
+    uid: str
+    user_email: str
+    machine: str
+    label: str | None = None
+    repo: str | None = None
+    branch: str | None = None
+    first_at: datetime
+
+
+class WorkStartResponse(BaseModel):
+    match: WorkStartMatch | None = None
+
+
 class UpdateRequest(BaseModel):
     uid: str
     task: str | None = None

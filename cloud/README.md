@@ -8,6 +8,10 @@ The single-file CLI at the repo root stays zero-dep and works without any of
 this — point sessions at a cloud server only if you want awareness across
 machines.
 
+Public sessions also check their first substantial opening brief against
+recent briefs from every authenticated user. The API stores only opaque prompt
+and plan fingerprints for seven days; private sessions never send a brief.
+
 ## What's in here
 
 | Path | Purpose |

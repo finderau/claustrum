@@ -238,14 +238,14 @@ def _print_private_banner_once():
     sys.stderr.flush()
 
 
-def _resolve_auth():
+def _resolve_auth(timeout=10):
     """Return (header_name, header_value) or None if no auth configured."""
     header = os.environ.get("CLAUSTRUM_AUTH_HEADER", "").strip() or "Authorization"
     cmd = os.environ.get("CLAUSTRUM_AUTH_COMMAND", "").strip()
     if cmd:
         try:
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=10,
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout,
             )
             value = result.stdout.strip()
             if value:
@@ -325,7 +325,7 @@ def _ssl_context():
     return _SSL_CTX
 
 
-def _cloud_request(method, path, body=None, params=None, timeout=None):
+def _cloud_request(method, path, body=None, params=None, timeout=None, auth_timeout=10):
     """Synchronous best-effort HTTP request. Returns dict on success, None
     on any failure. Caller has already gated on _should_cloud_send."""
     url = _cloud_url()
@@ -341,7 +341,7 @@ def _cloud_request(method, path, body=None, params=None, timeout=None):
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    auth = _resolve_auth()
+    auth = _resolve_auth(timeout=auth_timeout)
     if auth:
         headers[auth[0]] = auth[1]
     req = _urlrequest.Request(full, data=data, headers=headers, method=method)
@@ -1807,9 +1807,12 @@ def _init_schema(db):
             first_at     REAL NOT NULL,
             prompt_hash  TEXT NOT NULL,
             plan_path    TEXT,
+            plan_key     TEXT,
+            repo         TEXT,
             branch       TEXT,
             label        TEXT,
-            private      INTEGER NOT NULL DEFAULT 0
+            private      INTEGER NOT NULL DEFAULT 0,
+            acknowledged INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_work_starts_first_at
             ON work_starts(first_at);
@@ -1836,6 +1839,11 @@ def _init_schema(db):
     # a session classifies once and is never auto-revisited); the columns are kept
     # so existing DBs don't error and are zeroed on an explicit reclassify.
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
+    work_start_columns = {r["name"] for r in db.execute("PRAGMA table_info(work_starts)")}
+    for col, decl in (("plan_key", "TEXT"), ("repo", "TEXT"),
+                      ("acknowledged", "INTEGER NOT NULL DEFAULT 1")):
+        if col not in work_start_columns:
+            db.execute(f"ALTER TABLE work_starts ADD COLUMN {col} {decl}")
     for col, decl in (
         ("host", "TEXT"),
         ("tmux_pane", "TEXT"),
@@ -4231,17 +4239,31 @@ def _build_classify_block(uid, transcript_path=None):
 # Every handler is wrapped in try/except at the dispatch level.
 # ---------------------------------------------------------------------------
 
-_OPENING_PLAN_RE = re.compile(r"(/[\w./-]*(?:plan|brief|spec)[\w./-]*\.md)\b", re.IGNORECASE)
-_OPENING_BRANCH_RE = re.compile(r"\b(?:local\s+)?branch\s+[`\"']?([\w.-]+/[\w./-]+)", re.IGNORECASE)
+_OPENING_PLAN_RE = re.compile(r"(/[\w./-]+\.md)\b", re.IGNORECASE)
+_OPENING_BRANCH_RE = re.compile(r"\b(?:local\s+)?branch\s+[`\"']?([\w./-]+)", re.IGNORECASE)
 
 
 def _record_work_start(db, uid, raw_prompt, now):
     """Keep the first substantial brief after the session row has been reaped."""
     if (uid == "unknown" or len(raw_prompt.strip()) < 120
             or _is_harness_prompt(raw_prompt)):
-        return None
-    if db.execute("SELECT 1 FROM work_starts WHERE uid = ?", (uid,)).fetchone():
-        return None
+        return None, None
+    existing = db.execute("SELECT * FROM work_starts WHERE uid = ?", (uid,)).fetchone()
+    if existing:
+        if not existing["acknowledged"]:
+            db.execute("UPDATE work_starts SET acknowledged = 1 WHERE uid = ?", (uid,))
+            return None, {
+                "uid": uid, "machine": _host(), "label": existing["label"],
+                "prompt_hash": existing["prompt_hash"], "plan_key": existing["plan_key"],
+                "repo": existing["repo"], "branch": existing["branch"],
+                "acknowledge": True,
+            }
+        return None, None
+    prior_turns = db.execute(
+        "SELECT COALESCE(turn_count, 0) FROM sessions WHERE uid = ?", (uid,)
+    ).fetchone()
+    if prior_turns and prior_turns[0] > 0:
+        return None, None
 
     normalized = " ".join(raw_prompt.split()).casefold()
     prompt_hash = hashlib.sha256(normalized.encode()).hexdigest()
@@ -4249,36 +4271,65 @@ def _record_work_start(db, uid, raw_prompt, now):
     branch = _OPENING_BRANCH_RE.search(raw_prompt)
     plan_path = os.path.normpath(plan.group(1)) if plan else None
     branch_name = branch.group(1).rstrip(".,;)") if branch else None
+    repo = plan_key = None
+    if plan_path and os.path.isfile(plan_path):
+        repo, checkout_branch = _git_info(os.path.dirname(plan_path))
+        root = _git_toplevel(os.path.dirname(plan_path))
+        branch_name = branch_name or checkout_branch
+        if repo and root and branch_name:
+            rel = os.path.relpath(os.path.realpath(plan_path), os.path.realpath(root))
+            if not rel.startswith(".."):
+                key = f"{repo.casefold()}:{rel.replace(os.sep, '/').casefold()}:{branch_name.casefold()}"
+                plan_key = hashlib.sha256(key.encode()).hexdigest()
     private = 1 if _privacy_mode() else 0
     db.execute("DELETE FROM work_starts WHERE first_at < ?", (now - DUPLICATE_WORK_SECONDS,))
     previous = db.execute(
         "SELECT w.uid, COALESCE(s.label, w.label) AS label, w.first_at, "
         "w.plan_path, w.branch FROM work_starts w "
         "LEFT JOIN sessions s ON s.uid = w.uid "
-        "WHERE w.uid != ? AND w.private = ? AND w.first_at >= ? "
+        "WHERE w.uid != ? AND w.private = ? AND w.acknowledged = 1 "
+        "AND w.first_at >= ? "
         "AND (w.prompt_hash = ? OR (? IS NOT NULL AND ? IS NOT NULL "
-        "AND w.plan_path = ? AND w.branch = ?)) "
+        "AND w.plan_path = ? AND w.branch = ?) "
+        "OR (? IS NOT NULL AND w.plan_key = ?)) "
         "ORDER BY w.first_at DESC LIMIT 1",
         (uid, private, now - DUPLICATE_WORK_SECONDS, prompt_hash,
-         plan_path, branch_name, plan_path, branch_name),
+         plan_path, branch_name, plan_path, branch_name, plan_key, plan_key),
     ).fetchone()
+    label = _get_session_label()
     db.execute(
         "INSERT INTO work_starts "
-        "(uid, first_at, prompt_hash, plan_path, branch, label, private) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (uid, now, prompt_hash, plan_path, branch_name, _get_session_label(), private),
+        "(uid, first_at, prompt_hash, plan_path, plan_key, repo, branch, label, private, acknowledged) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (uid, now, prompt_hash, plan_path, plan_key, repo, branch_name,
+         label, private, 0 if previous else 1),
     )
-    return previous
+    return previous, {
+        "uid": uid, "machine": _host(), "label": label,
+        "prompt_hash": prompt_hash, "plan_key": plan_key,
+        "repo": repo, "branch": branch_name, "acknowledge": False,
+    }
+
+
+def _cloud_work_start(record):
+    if not _should_cloud_send():
+        return None
+    return _cloud_request("POST", "/v1/work-start", body=record,
+                          timeout=4, auth_timeout=5)
 
 
 def _duplicate_work_message(previous, now):
     label = previous["label"] or previous["uid"][:12]
-    ago = _format_ago(now - previous["first_at"])
-    where = (f" (plan {previous['plan_path']}, branch {previous['branch']})"
-             if previous["plan_path"] and previous["branch"] else "")
+    started = previous["first_at"]
+    if isinstance(started, str):
+        started = _dt.datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+    ago = _format_ago(now - started)
+    owner = f" by {previous['user_email']}" if previous.get("user_email") else ""
+    where = (f" ({previous['repo']}, branch {previous['branch']})"
+             if previous.get("repo") and previous.get("branch") else "")
     return (
         f"Claustrum duplicate-work check: this opening brief matches an earlier "
-        f"session, {label} ({ago} ago){where}.\n"
+        f"session, {label}{owner} ({ago} ago){where}.\n"
         "STOP: review that session's progress and any existing PR before doing "
         "the work again. If this is an intentional handoff, resend the prompt "
         "after reviewing it."
@@ -4303,13 +4354,23 @@ def hook_prompt(_args):
     _reap_dead(db, now)
 
     if os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
-        previous = _record_work_start(db, uid, raw_prompt, now)
+        previous, record = _record_work_start(db, uid, raw_prompt, now)
         if previous:
-            warning = _duplicate_work_message(previous, now)
+            warning = _duplicate_work_message(dict(previous), now)
             db.commit()
             db.close()
             print(warning, file=sys.stderr)
             sys.exit(2)
+        if record and not _privacy_mode():
+            db.commit()
+            cloud_result = _cloud_work_start(record)
+            match = cloud_result.get("match") if isinstance(cloud_result, dict) else None
+            if match and not record["acknowledge"]:
+                db.execute("UPDATE work_starts SET acknowledged = 0 WHERE uid = ?", (uid,))
+                db.commit()
+                db.close()
+                print(_duplicate_work_message(match, now), file=sys.stderr)
+                sys.exit(2)
 
     # Auto-set task from user's prompt LOCALLY so same-machine sessions see
     # intent. This stays in SQLite and NEVER leaves the machine.
@@ -4350,7 +4411,7 @@ def hook_prompt(_args):
             (transcript_path, uid),
         )
 
-    # Cloud data is NON-BLOCKING: the actual write-through (checkin + topic
+    # Routine cloud data is NON-BLOCKING: the actual write-through (checkin + topic
     # mirror + peer roster + inbox drain — all the slow IAP/network work) runs in
     # a detached `cloud-sync` worker spawned at the end of this hook. Here we
     # only READ that worker's last result from the cloud cache, so the hook never
