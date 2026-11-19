@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -160,9 +161,54 @@ def test_clear_reopens_same_session_with_new_opening_id(local, monkeypatch):
         "session_id": "same", "cwd": "/projects", "source": "clear",
     })))
     local.hook_start(None)
-    changed = BRIEF.replace("Continue the bot MCP identity migration", "Begin different work")
+    changed = (
+        "Prepare a separate training guide for the support team, with examples "
+        "of the customer-facing steps and a review checklist for the new workflow. "
+        "This is independent of the bot gateway migration."
+    )
     assert _prompt(local, monkeypatch, "same", changed)[0] == 0
     assert len(sent) == 2 and sent[0]["opening_id"] != sent[1]["opening_id"]
+
+
+def test_private_opening_survives_clear_for_other_sessions(local, monkeypatch):
+    monkeypatch.setenv("CLAUSTRUM_PRIVATE", "1")
+    assert _prompt(local, monkeypatch, "first", BRIEF)[0] == 0
+    monkeypatch.setattr(local, "_cloud_checkin", lambda uid, cwd=None: None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "session_id": "first", "cwd": "/projects", "source": "clear",
+    })))
+    local.hook_start(None)
+    unrelated = (
+        "Prepare a separate training guide for the support team, with examples "
+        "of the customer-facing steps and a review checklist for the new workflow. "
+        "This is independent of the bot gateway migration."
+    )
+    assert _prompt(local, monkeypatch, "first", unrelated)[0] == 0
+    assert _prompt(local, monkeypatch, "other", BRIEF)[0] == 2
+    db = local.get_db()
+    assert db.execute("SELECT COUNT(*) FROM work_starts WHERE uid = 'first'").fetchone()[0] == 2
+    db.close()
+
+
+def test_old_local_work_start_schema_migrates_without_losing_fingerprint(local):
+    db = sqlite3.connect(local.DB_PATH)
+    db.execute(
+        "CREATE TABLE work_starts (uid TEXT PRIMARY KEY, opening_id TEXT, "
+        "first_at REAL NOT NULL, prompt_hash TEXT NOT NULL, plan_path TEXT, "
+        "plan_key TEXT, repo TEXT, branch TEXT, label TEXT, private INTEGER, "
+        "acknowledged INTEGER)"
+    )
+    db.execute(
+        "INSERT INTO work_starts (uid, first_at, prompt_hash, private, acknowledged) "
+        "VALUES ('old', 100, 'abc', 1, 1)"
+    )
+    db.commit()
+    db.close()
+    upgraded = local.get_db()
+    row = upgraded.execute("SELECT opening_id, uid, prompt_hash FROM work_starts").fetchone()
+    assert tuple(row) == ("old", "old", "abc")
+    assert [r["name"] for r in upgraded.execute("PRAGMA table_info(work_starts)") if r["pk"]] == ["opening_id"]
+    upgraded.close()
 
 
 def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):

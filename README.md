@@ -58,7 +58,8 @@ The backing store is a single SQLite file (`~/.claustrum/state.db`) in WAL mode.
 
 ### Duplicate opening briefs
 
-Claustrum keeps a seven-day record of each session's first substantial prompt.
+Claustrum keeps a seven-day record of each session opening's first substantial
+prompt. `/clear` starts a new opening while retaining earlier fingerprints.
 A new session with the same prompt, or the same Markdown plan and branch named
 in its prompt, stops once at `UserPromptSubmit` and shows the earlier session.
 This catches a repeated seed even when the first session has exited, its live
