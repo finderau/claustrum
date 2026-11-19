@@ -8,6 +8,7 @@ import io
 import json
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ spec = importlib.util.spec_from_loader("claustrum_cli_duplicate", loader)
 cli = importlib.util.module_from_spec(spec)
 sys.modules["claustrum_cli_duplicate"] = cli
 loader.exec_module(cli)
+REAL_CLOUD_WORK_START = cli._cloud_work_start
 
 PLAN = "/projects/workspace-automation/docs/bot-iap-gateway-migration-plan.md"
 BRIEF = (
@@ -35,7 +37,7 @@ def local(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_reap_dead", lambda db, now: [])
     monkeypatch.setattr(cli, "_get_session_label", lambda: "bot-iap-gateway-migration")
     monkeypatch.setattr(cli, "_spawn_cloud_sync", lambda uid, cwd: None)
-    monkeypatch.setattr(cli, "_cloud_work_start", lambda record: None)
+    monkeypatch.setattr(cli, "_cloud_work_start", lambda record, deadline: None)
     root = tmp_path / "workspace-automation"
     (root / "docs").mkdir(parents=True)
     cli._test_plan = root / "docs" / "bot-iap-gateway-migration-plan.md"
@@ -156,7 +158,7 @@ def test_new_session_stays_eligible_after_a_short_first_prompt(local, monkeypatc
 
 def test_clear_reopens_same_session_with_new_opening_id(local, monkeypatch):
     sent = []
-    monkeypatch.setattr(local, "_cloud_work_start", lambda record: sent.append(record) or None)
+    monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: sent.append(record) or None)
     assert _prompt(local, monkeypatch, "same", BRIEF)[0] == 0
     monkeypatch.setattr(local, "_cloud_checkin", lambda uid, cwd=None: None)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
@@ -242,7 +244,7 @@ def test_old_local_work_start_schema_migrates_without_losing_fingerprint(local):
 def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):
     sent = []
 
-    def cloud(record):
+    def cloud(record, deadline):
         sent.append(record)
         if not record["acknowledge"]:
             return {"match": {
@@ -264,5 +266,21 @@ def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):
 
 def test_private_session_never_calls_cloud(local, monkeypatch):
     monkeypatch.setenv("CLAUSTRUM_PRIVATE", "1")
-    monkeypatch.setattr(local, "_cloud_work_start", lambda record: pytest.fail("private cloud call"))
+    monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: pytest.fail("private cloud call"))
     assert _prompt(local, monkeypatch, "private", BRIEF)[0] == 0
+
+
+def test_cloud_work_start_respects_prompt_deadline(local, monkeypatch):
+    monkeypatch.setattr(local, "_should_cloud_send", lambda: True)
+
+    def slow_request(*args, **kwargs):
+        time.sleep(0.7)
+        return {"match": None}
+
+    monkeypatch.setattr(local, "_cloud_request", slow_request)
+    start = time.monotonic()
+    assert REAL_CLOUD_WORK_START({}, start + 0.02) is None
+    assert time.monotonic() - start < 0.5
+
+    monkeypatch.setattr(local, "_cloud_request", lambda *args, **kwargs: {"match": None})
+    assert REAL_CLOUD_WORK_START({}, time.monotonic() + 1) == {"match": None}

@@ -75,8 +75,9 @@ text or absolute path is sent. Cloud compares briefs across all authenticated
 users, regardless of machine or topic. Private sessions never call this endpoint
 or appear in company matches. If Cloud is unavailable, the local check still
 runs and the prompt continues. Cloud is contacted only on a new substantial
-opening brief or its deliberate retry, not on every turn. Sessions started
-before this check was installed have no opening-brief record.
+opening brief or its deliberate retry, with a four-second hook budget, not on
+every turn. Sessions started before this check was installed have no
+opening-brief record.
 
 ## Quick Start
 
