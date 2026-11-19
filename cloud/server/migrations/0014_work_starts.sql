@@ -1,5 +1,6 @@
 CREATE TABLE IF NOT EXISTS work_starts (
-    uid          text PRIMARY KEY,
+    uid          text NOT NULL,
+    opening_id   text NOT NULL,
     user_email   text NOT NULL,
     machine      text NOT NULL,
     label        text,
@@ -8,7 +9,8 @@ CREATE TABLE IF NOT EXISTS work_starts (
     repo         text,
     branch       text,
     acknowledged boolean NOT NULL DEFAULT true,
-    first_at     timestamptz NOT NULL DEFAULT now()
+    first_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (uid, opening_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_work_starts_prompt

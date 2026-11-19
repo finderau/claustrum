@@ -41,6 +41,7 @@ class CheckinResponse(BaseModel):
 
 class WorkStartRequest(BaseModel):
     uid: str = Field(min_length=1, max_length=128)
+    opening_id: str = Field(min_length=1, max_length=128)
     machine: str = Field(min_length=1, max_length=128)
     label: str | None = Field(default=None, max_length=128)
     prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")

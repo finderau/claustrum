@@ -32,6 +32,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from urllib import request as _urlrequest
 from urllib import parse as _urlparse
@@ -1804,6 +1805,7 @@ def _init_schema(db):
 
         CREATE TABLE IF NOT EXISTS work_starts (
             uid          TEXT PRIMARY KEY,
+            opening_id   TEXT,
             first_at     REAL NOT NULL,
             prompt_hash  TEXT NOT NULL,
             plan_path    TEXT,
@@ -1840,7 +1842,7 @@ def _init_schema(db):
     # so existing DBs don't error and are zeroed on an explicit reclassify.
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
     work_start_columns = {r["name"] for r in db.execute("PRAGMA table_info(work_starts)")}
-    for col, decl in (("plan_key", "TEXT"), ("repo", "TEXT"),
+    for col, decl in (("opening_id", "TEXT"), ("plan_key", "TEXT"), ("repo", "TEXT"),
                       ("acknowledged", "INTEGER NOT NULL DEFAULT 1")):
         if col not in work_start_columns:
             db.execute(f"ALTER TABLE work_starts ADD COLUMN {col} {decl}")
@@ -1919,6 +1921,7 @@ def _init_schema(db):
         ("repo", "TEXT"),
         ("branch", "TEXT"),
         ("repo_root", "TEXT"),
+        ("work_start_eligible", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -2738,8 +2741,9 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
         """
         INSERT INTO sessions
             (uid, label, status, cwd, last_seen, started_at, last_activity,
-             host, tmux_pane, pid, boot_id, private, msg_socket, agent)
-        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             host, tmux_pane, pid, boot_id, private, msg_socket, agent,
+             work_start_eligible)
+        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(uid) DO UPDATE SET
             label = COALESCE(?, label),
             status = 'active',
@@ -4253,16 +4257,17 @@ def _record_work_start(db, uid, raw_prompt, now):
         if not existing["acknowledged"]:
             db.execute("UPDATE work_starts SET acknowledged = 1 WHERE uid = ?", (uid,))
             return None, {
-                "uid": uid, "machine": _host(), "label": existing["label"],
+                "uid": uid, "opening_id": existing["opening_id"] or uid,
+                "machine": _host(), "label": existing["label"],
                 "prompt_hash": existing["prompt_hash"], "plan_key": existing["plan_key"],
                 "repo": existing["repo"], "branch": existing["branch"],
                 "acknowledge": True,
             }
         return None, None
-    prior_turns = db.execute(
-        "SELECT COALESCE(turn_count, 0) FROM sessions WHERE uid = ?", (uid,)
+    eligibility = db.execute(
+        "SELECT COALESCE(work_start_eligible, 0) FROM sessions WHERE uid = ?", (uid,)
     ).fetchone()
-    if prior_turns and prior_turns[0] > 0:
+    if not eligibility or not eligibility[0]:
         return None, None
 
     normalized = " ".join(raw_prompt.split()).casefold()
@@ -4297,15 +4302,17 @@ def _record_work_start(db, uid, raw_prompt, now):
          plan_path, branch_name, plan_path, branch_name, plan_key, plan_key),
     ).fetchone()
     label = _get_session_label()
+    opening_id = uuid.uuid4().hex
     db.execute(
         "INSERT INTO work_starts "
-        "(uid, first_at, prompt_hash, plan_path, plan_key, repo, branch, label, private, acknowledged) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (uid, now, prompt_hash, plan_path, plan_key, repo, branch_name,
+        "(uid, opening_id, first_at, prompt_hash, plan_path, plan_key, repo, branch, label, private, acknowledged) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (uid, opening_id, now, prompt_hash, plan_path, plan_key, repo, branch_name,
          label, private, 0 if previous else 1),
     )
+    db.execute("UPDATE sessions SET work_start_eligible = 0 WHERE uid = ?", (uid,))
     return previous, {
-        "uid": uid, "machine": _host(), "label": label,
+        "uid": uid, "opening_id": opening_id, "machine": _host(), "label": label,
         "prompt_hash": prompt_hash, "plan_key": plan_key,
         "repo": repo, "branch": branch_name, "acknowledge": False,
     }
@@ -4905,7 +4912,8 @@ def hook_start(_args):
         db.execute("DELETE FROM work_starts WHERE uid = ?", (uid,))
         db.execute(
             "UPDATE sessions SET "
-            "turn_count = 0, topic = NULL, domain = NULL, topic_confidence = NULL, "
+            "turn_count = 0, work_start_eligible = 1, "
+            "topic = NULL, domain = NULL, topic_confidence = NULL, "
             "task = NULL, working_on = NULL, end_reason = NULL, classify_locked = 0, "
             "classify_prompted = 0, classify_attempts = 0, classify_failed = 0, "
             "classify_spawned_at = NULL, classify_error = NULL, "

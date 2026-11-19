@@ -17,14 +17,18 @@ async def work_start(req: WorkStartRequest, user_email: str = Depends(current_us
             for key in keys:
                 await cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (key,))
 
-            await cur.execute("SELECT user_email FROM work_starts WHERE uid = %s", (req.uid,))
+            await cur.execute(
+                "SELECT user_email FROM work_starts WHERE uid = %s AND opening_id = %s",
+                (req.uid, req.opening_id),
+            )
             existing = await cur.fetchone()
             if existing:
                 if existing[0] != user_email:
                     raise HTTPException(status_code=409, detail="Session ID already belongs to another user")
                 if req.acknowledge:
                     await cur.execute(
-                        "UPDATE work_starts SET acknowledged = true WHERE uid = %s", (req.uid,)
+                        "UPDATE work_starts SET acknowledged = true "
+                        "WHERE uid = %s AND opening_id = %s", (req.uid, req.opening_id),
                     )
                 await c.commit()
                 return WorkStartResponse()
@@ -52,9 +56,9 @@ async def work_start(req: WorkStartRequest, user_email: str = Depends(current_us
             await cur.execute(
                 """
                 INSERT INTO work_starts
-                    (uid, user_email, machine, label, prompt_hash, plan_key,
+                    (uid, opening_id, user_email, machine, label, prompt_hash, plan_key,
                      repo, branch, acknowledged)
-                VALUES (%(uid)s, %(user_email)s, %(machine)s, %(label)s,
+                VALUES (%(uid)s, %(opening_id)s, %(user_email)s, %(machine)s, %(label)s,
                         %(prompt_hash)s, %(plan_key)s, %(repo)s, %(branch)s,
                         %(acknowledged)s)
                 """,

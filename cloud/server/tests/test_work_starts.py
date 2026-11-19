@@ -13,11 +13,11 @@ from app.models import WorkStartRequest
 
 def test_work_start_accepts_only_opaque_fingerprints():
     good = hashlib.sha256(b"substantial opening brief").hexdigest()
-    assert WorkStartRequest(uid="session", machine="host", prompt_hash=good).plan_key is None
+    assert WorkStartRequest(uid="session", opening_id="opening", machine="host", prompt_hash=good).plan_key is None
     with pytest.raises(ValidationError):
-        WorkStartRequest(uid="session", machine="host", prompt_hash="a raw prompt")
+        WorkStartRequest(uid="session", opening_id="opening", machine="host", prompt_hash="a raw prompt")
     with pytest.raises(ValidationError):
-        WorkStartRequest(uid="session", machine="host", prompt_hash=good, plan_key="docs/plan.md")
+        WorkStartRequest(uid="session", opening_id="opening", machine="host", prompt_hash=good, plan_key="docs/plan.md")
 
 
 DB_URL = os.environ.get("CLAUSTRUM_TEST_DB_URL")
@@ -47,10 +47,10 @@ async def test_cross_user_match_and_intentional_retry(api):
     first = f"first-{run}@finder.com"
     second = f"second-{run}@finder.com"
 
-    async def post(user, uid, *, prompt=prompt_hash, plan=plan_key, acknowledge=False):
+    async def post(user, uid, *, opening=None, prompt=prompt_hash, plan=plan_key, acknowledge=False):
         response = await api.post(
             "/v1/work-start", headers={"X-Claustrum-User-Email": user},
-            json={"uid": uid, "machine": "laptop", "label": uid,
+            json={"uid": uid, "opening_id": opening or uid, "machine": "laptop", "label": uid,
                   "prompt_hash": prompt, "plan_key": plan, "repo": "workspace-automation",
                   "branch": "docs/bot-migration", "acknowledge": acknowledge},
         )
@@ -65,6 +65,16 @@ async def test_cross_user_match_and_intentional_retry(api):
         assert (await post(second, f"second-{run}", prompt=changed, acknowledge=True))["match"] is None
         third = (await post(first, f"third-{run}", prompt=changed))["match"]
         assert third["uid"] == f"second-{run}"
+
+        changed_again = hashlib.sha256((run + ":after clear").encode()).hexdigest()
+        after_clear = (await post(first, f"first-{run}", opening=f"new-opening-{run}",
+                                  prompt=changed_again))["match"]
+        assert after_clear["uid"] == f"second-{run}"
+        await post(first, f"first-{run}", opening=f"new-opening-{run}",
+                   prompt=changed_again, acknowledge=True)
+        new_brief = (await post(second, f"fourth-{run}", prompt=changed_again,
+                                plan=None))["match"]
+        assert new_brief["uid"] == f"first-{run}"
     finally:
         for user in (first, second):
             await api.post("/v1/reset", headers={"X-Claustrum-User-Email": user})
@@ -78,7 +88,8 @@ async def test_simultaneous_cross_user_start_blocks_one(api):
     async def start(n):
         return await api.post(
             "/v1/work-start", headers={"X-Claustrum-User-Email": f"{n}-{run}@finder.com"},
-            json={"uid": f"{n}-{run}", "machine": "laptop", "prompt_hash": prompt_hash},
+            json={"uid": f"{n}-{run}", "opening_id": f"{n}-opening-{run}",
+                  "machine": "laptop", "prompt_hash": prompt_hash},
         )
 
     try:

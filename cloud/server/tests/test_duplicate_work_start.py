@@ -132,7 +132,7 @@ def test_old_brief_expires_and_opt_out_works(local, monkeypatch):
 def test_existing_conversation_after_upgrade_does_not_register_late_prompt(local, monkeypatch):
     db = local.get_db()
     local._ensure_session(db, "old", "/projects")
-    db.execute("UPDATE sessions SET turn_count = 5 WHERE uid = 'old'")
+    db.execute("UPDATE sessions SET turn_count = 5, work_start_eligible = 0 WHERE uid = 'old'")
     db.commit()
     db.close()
     assert _prompt(local, monkeypatch, "old", BRIEF)[0] == 0
@@ -140,6 +140,29 @@ def test_existing_conversation_after_upgrade_does_not_register_late_prompt(local
     assert db.execute("SELECT 1 FROM work_starts WHERE uid = 'old'").fetchone() is None
     db.close()
     assert _prompt(local, monkeypatch, "new", BRIEF)[0] == 0
+
+
+def test_new_session_stays_eligible_after_a_short_first_prompt(local, monkeypatch):
+    assert _prompt(local, monkeypatch, "new", "Run tests")[0] == 0
+    assert _prompt(local, monkeypatch, "new", BRIEF)[0] == 0
+    db = local.get_db()
+    assert db.execute("SELECT opening_id FROM work_starts WHERE uid = 'new'").fetchone()[0]
+    db.close()
+    assert _prompt(local, monkeypatch, "other", BRIEF)[0] == 2
+
+
+def test_clear_reopens_same_session_with_new_opening_id(local, monkeypatch):
+    sent = []
+    monkeypatch.setattr(local, "_cloud_work_start", lambda record: sent.append(record) or None)
+    assert _prompt(local, monkeypatch, "same", BRIEF)[0] == 0
+    monkeypatch.setattr(local, "_cloud_checkin", lambda uid, cwd=None: None)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "session_id": "same", "cwd": "/projects", "source": "clear",
+    })))
+    local.hook_start(None)
+    changed = BRIEF.replace("Continue the bot MCP identity migration", "Begin different work")
+    assert _prompt(local, monkeypatch, "same", changed)[0] == 0
+    assert len(sent) == 2 and sent[0]["opening_id"] != sent[1]["opening_id"]
 
 
 def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):
