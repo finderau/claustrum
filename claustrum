@@ -22,6 +22,7 @@ Hook integration:
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -44,6 +45,7 @@ DB_DIR = Path.home() / ".claustrum"
 DB_PATH = DB_DIR / "state.db"
 STALE_SECONDS = 432000   # 5 days without heartbeat = stale
 CLEANUP_SECONDS = 432000 # 5 days = remove done/stale sessions
+DUPLICATE_WORK_SECONDS = 604800  # recent opening briefs remain visible after a session exits
 ABANDONED_ACTIVE_SECONDS = 86400  # 24h: inactive sessions drop to paused
 PLACEHOLDER_SETTLE_SECONDS = 600  # a tmux- placeholder the hook hasn't replaced by now is the session
 
@@ -1799,6 +1801,18 @@ def _init_schema(db):
             shown_at     REAL NOT NULL,
             PRIMARY KEY (uid, item)
         );
+
+        CREATE TABLE IF NOT EXISTS work_starts (
+            uid          TEXT PRIMARY KEY,
+            first_at     REAL NOT NULL,
+            prompt_hash  TEXT NOT NULL,
+            plan_path    TEXT,
+            branch       TEXT,
+            label        TEXT,
+            private      INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_starts_first_at
+            ON work_starts(first_at);
     """)
     # Migrate older DBs: add liveness columns if missing. Existing rows get
     # NULLs and fall back to the timer until their next heartbeat repopulates
@@ -4217,6 +4231,60 @@ def _build_classify_block(uid, transcript_path=None):
 # Every handler is wrapped in try/except at the dispatch level.
 # ---------------------------------------------------------------------------
 
+_OPENING_PLAN_RE = re.compile(r"(/[\w./-]*(?:plan|brief|spec)[\w./-]*\.md)\b", re.IGNORECASE)
+_OPENING_BRANCH_RE = re.compile(r"\b(?:local\s+)?branch\s+[`\"']?([\w.-]+/[\w./-]+)", re.IGNORECASE)
+
+
+def _record_work_start(db, uid, raw_prompt, now):
+    """Keep the first substantial brief after the session row has been reaped."""
+    if (uid == "unknown" or len(raw_prompt.strip()) < 120
+            or _is_harness_prompt(raw_prompt)):
+        return None
+    if db.execute("SELECT 1 FROM work_starts WHERE uid = ?", (uid,)).fetchone():
+        return None
+
+    normalized = " ".join(raw_prompt.split()).casefold()
+    prompt_hash = hashlib.sha256(normalized.encode()).hexdigest()
+    plan = _OPENING_PLAN_RE.search(raw_prompt)
+    branch = _OPENING_BRANCH_RE.search(raw_prompt)
+    plan_path = os.path.normpath(plan.group(1)) if plan else None
+    branch_name = branch.group(1).rstrip(".,;)") if branch else None
+    private = 1 if _privacy_mode() else 0
+    db.execute("DELETE FROM work_starts WHERE first_at < ?", (now - DUPLICATE_WORK_SECONDS,))
+    previous = db.execute(
+        "SELECT w.uid, COALESCE(s.label, w.label) AS label, w.first_at, "
+        "w.plan_path, w.branch FROM work_starts w "
+        "LEFT JOIN sessions s ON s.uid = w.uid "
+        "WHERE w.uid != ? AND w.private = ? AND w.first_at >= ? "
+        "AND (w.prompt_hash = ? OR (? IS NOT NULL AND ? IS NOT NULL "
+        "AND w.plan_path = ? AND w.branch = ?)) "
+        "ORDER BY w.first_at DESC LIMIT 1",
+        (uid, private, now - DUPLICATE_WORK_SECONDS, prompt_hash,
+         plan_path, branch_name, plan_path, branch_name),
+    ).fetchone()
+    db.execute(
+        "INSERT INTO work_starts "
+        "(uid, first_at, prompt_hash, plan_path, branch, label, private) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (uid, now, prompt_hash, plan_path, branch_name, _get_session_label(), private),
+    )
+    return previous
+
+
+def _duplicate_work_message(previous, now):
+    label = previous["label"] or previous["uid"][:12]
+    ago = _format_ago(now - previous["first_at"])
+    where = (f" (plan {previous['plan_path']}, branch {previous['branch']})"
+             if previous["plan_path"] and previous["branch"] else "")
+    return (
+        f"Claustrum duplicate-work check: this opening brief matches an earlier "
+        f"session, {label} ({ago} ago){where}.\n"
+        "STOP: review that session's progress and any existing PR before doing "
+        "the work again. If this is an intentional handoff, resend the prompt "
+        "after reviewing it."
+    )
+
+
 def hook_prompt(_args):
     """UserPromptSubmit — heartbeat, read messages, inject context."""
     data = json.load(sys.stdin)
@@ -4233,6 +4301,15 @@ def hook_prompt(_args):
     # Reap dead same-host sessions (and release their stale claims) using
     # tmux/boot ground truth, so the roster below reflects who's actually alive.
     _reap_dead(db, now)
+
+    if os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
+        previous = _record_work_start(db, uid, raw_prompt, now)
+        if previous:
+            warning = _duplicate_work_message(previous, now)
+            db.commit()
+            db.close()
+            print(warning, file=sys.stderr)
+            sys.exit(2)
 
     # Auto-set task from user's prompt LOCALLY so same-machine sessions see
     # intent. This stays in SQLite and NEVER leaves the machine.
@@ -4764,6 +4841,7 @@ def hook_start(_args):
     if not inherit_cls:
         # A cleared session starts afresh: reset turn_count and any prior
         # classification metadata in case this UID was reused.
+        db.execute("DELETE FROM work_starts WHERE uid = ?", (uid,))
         db.execute(
             "UPDATE sessions SET "
             "turn_count = 0, topic = NULL, domain = NULL, topic_confidence = NULL, "
@@ -6426,7 +6504,8 @@ def cmd_reset(args):
     db = get_db()
     db.executescript(
         "DELETE FROM sessions; DELETE FROM messages; DELETE FROM claims; "
-        "DELETE FROM overlap_gate_runs; DELETE FROM overlap_shown;"
+        "DELETE FROM overlap_gate_runs; DELETE FROM overlap_shown; "
+        "DELETE FROM work_starts;"
     )
     db.close()
     print("Claustrum reset. All sessions, messages, and claims cleared.")
