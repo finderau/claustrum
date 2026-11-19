@@ -1730,14 +1730,15 @@ def get_db():
     DB_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(DB_PATH), timeout=5)
     db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
+    db.execute("PRAGMA journal_mode=WAL")
     _init_schema(db)
     return db
 
 
 def _init_schema(db):
     db.executescript("""
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS sessions (
             uid          TEXT PRIMARY KEY,
             label        TEXT,
@@ -1849,8 +1850,8 @@ def _init_schema(db):
             db.execute(f"ALTER TABLE work_starts ADD COLUMN {col} {decl}")
     old_key = [r["name"] for r in db.execute("PRAGMA table_info(work_starts)") if r["pk"]]
     if old_key == ["uid"]:
-        db.executescript("""
-            ALTER TABLE work_starts RENAME TO work_starts_old;
+        db.execute("ALTER TABLE work_starts RENAME TO work_starts_old")
+        db.execute("""
             CREATE TABLE work_starts (
                 opening_id TEXT PRIMARY KEY, uid TEXT NOT NULL,
                 first_at REAL NOT NULL, prompt_hash TEXT NOT NULL,
@@ -1858,15 +1859,17 @@ def _init_schema(db):
                 label TEXT, private INTEGER NOT NULL DEFAULT 0,
                 acknowledged INTEGER NOT NULL DEFAULT 1,
                 is_current INTEGER NOT NULL DEFAULT 1
-            );
+            )
+        """)
+        db.execute("""
             INSERT INTO work_starts
                 (opening_id, uid, first_at, prompt_hash, plan_path, plan_key,
                  repo, branch, label, private, acknowledged)
             SELECT COALESCE(opening_id, uid), uid, first_at, prompt_hash,
                    plan_path, plan_key, repo, branch, label, private, acknowledged
-            FROM work_starts_old;
-            DROP TABLE work_starts_old;
+            FROM work_starts_old
         """)
+        db.execute("DROP TABLE work_starts_old")
     db.execute("CREATE INDEX IF NOT EXISTS idx_work_starts_first_at ON work_starts(first_at)")
     db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_starts_current "
                "ON work_starts(uid) WHERE is_current = 1")
@@ -4279,22 +4282,7 @@ def _record_work_start(db, uid, raw_prompt, now):
     existing = db.execute(
         "SELECT * FROM work_starts WHERE uid = ? AND is_current = 1", (uid,)
     ).fetchone()
-    if existing:
-        if not existing["acknowledged"]:
-            db.execute("UPDATE work_starts SET acknowledged = 1 WHERE opening_id = ?",
-                       (existing["opening_id"],))
-            return None, {
-                "uid": uid, "opening_id": existing["opening_id"] or uid,
-                "machine": _host(), "label": existing["label"],
-                "prompt_hash": existing["prompt_hash"], "plan_key": existing["plan_key"],
-                "repo": existing["repo"], "branch": existing["branch"],
-                "acknowledge": True,
-            }
-        return None, None
-    eligibility = db.execute(
-        "SELECT COALESCE(work_start_eligible, 0) FROM sessions WHERE uid = ?", (uid,)
-    ).fetchone()
-    if not eligibility or not eligibility[0]:
+    if existing and existing["acknowledged"]:
         return None, None
 
     normalized = " ".join(raw_prompt.split()).casefold()
@@ -4314,6 +4302,31 @@ def _record_work_start(db, uid, raw_prompt, now):
                 key = f"{repo.casefold()}:{rel.replace(os.sep, '/').casefold()}:{branch_name.casefold()}"
                 plan_key = hashlib.sha256(key.encode()).hexdigest()
     private = 1 if _privacy_mode() else 0
+    if existing:
+        same_opening = existing["private"] == private and (
+            existing["prompt_hash"] == prompt_hash
+            or (plan_key and existing["plan_key"] == plan_key)
+            or (plan_path and branch_name and existing["plan_path"] == plan_path
+                and existing["branch"] == branch_name)
+        )
+        if same_opening:
+            db.execute("UPDATE work_starts SET acknowledged = 1 WHERE opening_id = ?",
+                       (existing["opening_id"],))
+            return None, {
+                "uid": uid, "opening_id": existing["opening_id"] or uid,
+                "machine": _host(), "label": existing["label"],
+                "prompt_hash": existing["prompt_hash"], "plan_key": existing["plan_key"],
+                "repo": existing["repo"], "branch": existing["branch"],
+                "acknowledge": True,
+            }
+        db.execute("UPDATE work_starts SET is_current = 0 WHERE opening_id = ?",
+                   (existing["opening_id"],))
+        db.execute("UPDATE sessions SET work_start_eligible = 1 WHERE uid = ?", (uid,))
+    eligibility = db.execute(
+        "SELECT COALESCE(work_start_eligible, 0) FROM sessions WHERE uid = ?", (uid,)
+    ).fetchone()
+    if not eligibility or not eligibility[0]:
+        return None, None
     db.execute("DELETE FROM work_starts WHERE first_at < ?", (now - DUPLICATE_WORK_SECONDS,))
     previous = db.execute(
         "SELECT w.uid, COALESCE(s.label, w.label) AS label, w.first_at, "

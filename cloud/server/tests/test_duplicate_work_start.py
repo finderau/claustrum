@@ -1,6 +1,7 @@
 """A repeated opening brief stops before a second session starts work."""
 
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import importlib.machinery
 import importlib.util
 import io
@@ -81,6 +82,7 @@ def test_same_plan_and_branch_catches_changed_commit_and_wording(local, monkeypa
     changed = BRIEF.replace("Continue the bot MCP identity migration", "Resume the gateway work")
     changed = changed.replace("6d0b1505", "999d2639")
     assert _prompt(local, monkeypatch, "second", changed)[0] == 2
+    assert _prompt(local, monkeypatch, "second", BRIEF)[0] == 0
 
 
 def test_plain_markdown_plan_and_branch_without_slash_match(local, monkeypatch):
@@ -190,6 +192,24 @@ def test_private_opening_survives_clear_for_other_sessions(local, monkeypatch):
     db.close()
 
 
+def test_unrelated_prompt_does_not_acknowledge_blocked_opening(local, monkeypatch):
+    assert _prompt(local, monkeypatch, "first", BRIEF)[0] == 0
+    assert _prompt(local, monkeypatch, "second", BRIEF)[0] == 2
+    unrelated = (
+        "Prepare a separate training guide for the support team, with examples "
+        "of the customer-facing steps and a review checklist for the new workflow. "
+        "This is independent of the bot gateway migration."
+    )
+    assert _prompt(local, monkeypatch, "second", unrelated)[0] == 0
+    db = local.get_db()
+    rows = db.execute(
+        "SELECT acknowledged, is_current FROM work_starts WHERE uid = 'second' "
+        "ORDER BY first_at"
+    ).fetchall()
+    assert [tuple(row) for row in rows] == [(0, 0), (1, 1)]
+    db.close()
+
+
 def test_old_local_work_start_schema_migrates_without_losing_fingerprint(local):
     db = sqlite3.connect(local.DB_PATH)
     db.execute(
@@ -204,11 +224,19 @@ def test_old_local_work_start_schema_migrates_without_losing_fingerprint(local):
     )
     db.commit()
     db.close()
-    upgraded = local.get_db()
-    row = upgraded.execute("SELECT opening_id, uid, prompt_hash FROM work_starts").fetchone()
-    assert tuple(row) == ("old", "old", "abc")
-    assert [r["name"] for r in upgraded.execute("PRAGMA table_info(work_starts)") if r["pk"]] == ["opening_id"]
-    upgraded.close()
+    def read_upgraded(_):
+        upgraded = local.get_db()
+        row = upgraded.execute("SELECT opening_id, uid, prompt_hash FROM work_starts").fetchone()
+        key = [r["name"] for r in upgraded.execute("PRAGMA table_info(work_starts)") if r["pk"]]
+        old = upgraded.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'work_starts_old'"
+        ).fetchone()
+        upgraded.close()
+        return tuple(row), key, old
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = list(pool.map(read_upgraded, range(2)))
+    assert rows == [(("old", "old", "abc"), ["opening_id"], None)] * 2
 
 
 def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):
