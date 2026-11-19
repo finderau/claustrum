@@ -1819,6 +1819,8 @@ def _init_schema(db):
             label        TEXT,
             private      INTEGER NOT NULL DEFAULT 0,
             acknowledged INTEGER NOT NULL DEFAULT 1,
+            cloud_checked INTEGER NOT NULL DEFAULT 0,
+            cloud_acknowledge INTEGER NOT NULL DEFAULT 0,
             is_current   INTEGER NOT NULL DEFAULT 1
         );
         CREATE INDEX IF NOT EXISTS idx_work_starts_first_at
@@ -1848,7 +1850,9 @@ def _init_schema(db):
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
     work_start_columns = {r["name"] for r in db.execute("PRAGMA table_info(work_starts)")}
     for col, decl in (("opening_id", "TEXT"), ("plan_key", "TEXT"), ("repo", "TEXT"),
-                      ("acknowledged", "INTEGER NOT NULL DEFAULT 1")):
+                      ("acknowledged", "INTEGER NOT NULL DEFAULT 1"),
+                      ("cloud_checked", "INTEGER NOT NULL DEFAULT 0"),
+                      ("cloud_acknowledge", "INTEGER NOT NULL DEFAULT 0")):
         if col not in work_start_columns:
             db.execute(f"ALTER TABLE work_starts ADD COLUMN {col} {decl}")
     old_key = [r["name"] for r in db.execute("PRAGMA table_info(work_starts)") if r["pk"]]
@@ -1861,15 +1865,19 @@ def _init_schema(db):
                 plan_path TEXT, plan_key TEXT, repo TEXT, branch TEXT,
                 label TEXT, private INTEGER NOT NULL DEFAULT 0,
                 acknowledged INTEGER NOT NULL DEFAULT 1,
+                cloud_checked INTEGER NOT NULL DEFAULT 0,
+                cloud_acknowledge INTEGER NOT NULL DEFAULT 0,
                 is_current INTEGER NOT NULL DEFAULT 1
             )
         """)
         db.execute("""
             INSERT INTO work_starts
                 (opening_id, uid, first_at, prompt_hash, plan_path, plan_key,
-                 repo, branch, label, private, acknowledged)
+                 repo, branch, label, private, acknowledged, cloud_checked,
+                 cloud_acknowledge)
             SELECT COALESCE(opening_id, uid), uid, first_at, prompt_hash,
-                   plan_path, plan_key, repo, branch, label, private, acknowledged
+                   plan_path, plan_key, repo, branch, label, private, acknowledged,
+                   cloud_checked, cloud_acknowledge
             FROM work_starts_old
         """)
         db.execute("DROP TABLE work_starts_old")
@@ -4286,7 +4294,15 @@ def _record_work_start(db, uid, raw_prompt, now):
         "SELECT * FROM work_starts WHERE uid = ? AND is_current = 1", (uid,)
     ).fetchone()
     if existing and existing["acknowledged"]:
-        return None, None
+        if existing["private"] or existing["cloud_checked"] or not _should_cloud_send():
+            return None, None
+        return None, {
+            "uid": uid, "opening_id": existing["opening_id"],
+            "machine": _host(), "label": existing["label"],
+            "prompt_hash": existing["prompt_hash"], "plan_key": existing["plan_key"],
+            "repo": existing["repo"], "branch": existing["branch"],
+            "acknowledge": bool(existing["cloud_acknowledge"]),
+        }
 
     normalized = " ".join(raw_prompt.split()).casefold()
     prompt_hash = hashlib.sha256(normalized.encode()).hexdigest()
@@ -4313,7 +4329,8 @@ def _record_work_start(db, uid, raw_prompt, now):
                 and existing["branch"] == branch_name)
         )
         if same_opening:
-            db.execute("UPDATE work_starts SET acknowledged = 1 WHERE opening_id = ?",
+            db.execute("UPDATE work_starts SET acknowledged = 1, "
+                       "cloud_checked = 0, cloud_acknowledge = 1 WHERE opening_id = ?",
                        (existing["opening_id"],))
             return None, {
                 "uid": uid, "opening_id": existing["opening_id"] or uid,
@@ -4348,10 +4365,11 @@ def _record_work_start(db, uid, raw_prompt, now):
     opening_id = uuid.uuid4().hex
     db.execute(
         "INSERT INTO work_starts "
-        "(opening_id, uid, first_at, prompt_hash, plan_path, plan_key, repo, branch, label, private, acknowledged) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(opening_id, uid, first_at, prompt_hash, plan_path, plan_key, repo, branch, "
+        "label, private, acknowledged, cloud_checked) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (opening_id, uid, now, prompt_hash, plan_path, plan_key, repo,
-         branch_name, label, private, 0 if previous else 1),
+         branch_name, label, private, 0 if previous else 1, private),
     )
     db.execute("UPDATE sessions SET work_start_eligible = 0 WHERE uid = ?", (uid,))
     return previous, {
@@ -4425,17 +4443,34 @@ def hook_prompt(_args):
             db.close()
             print(warning, file=sys.stderr)
             sys.exit(2)
-        if record and not _privacy_mode():
+        if record and _should_cloud_send():
             db.commit()
             cloud_result = _cloud_work_start(record, work_start_deadline)
-            match = cloud_result.get("match") if isinstance(cloud_result, dict) else None
+            if (not isinstance(cloud_result, dict)
+                    or "match" not in cloud_result
+                    or (cloud_result["match"] is not None
+                        and not isinstance(cloud_result["match"], dict))):
+                _spawn_cloud_sync(uid, cwd)
+                db.close()
+                print(
+                    "Claustrum duplicate-work check: the company-wide check is unavailable. "
+                    "This brief is recorded locally, but Cloud has not checked it. "
+                    "Resend the prompt after a moment, or set "
+                    "CLAUSTRUM_DUPLICATE_WORK=0 to work without this protection.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            match = cloud_result.get("match")
             if match and not record["acknowledge"]:
-                db.execute("UPDATE work_starts SET acknowledged = 0 WHERE opening_id = ?",
+                db.execute("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
+                           "WHERE opening_id = ?",
                            (record["opening_id"],))
                 db.commit()
                 db.close()
                 print(_duplicate_work_message(match, now), file=sys.stderr)
                 sys.exit(2)
+            db.execute("UPDATE work_starts SET cloud_checked = 1 WHERE opening_id = ?",
+                       (record["opening_id"],))
 
     # Auto-set task from user's prompt LOCALLY so same-machine sessions see
     # intent. This stays in SQLite and NEVER leaves the machine.

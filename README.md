@@ -73,11 +73,13 @@ timestamp. Public sessions also send the opaque prompt hash and a hash of the
 canonical repo, repo-relative plan path and branch to Claustrum Cloud. No prompt
 text or absolute path is sent. Cloud compares briefs across all authenticated
 users, regardless of machine or topic. Private sessions never call this endpoint
-or appear in company matches. If Cloud is unavailable, the local check still
-runs and the prompt continues. Cloud is contacted only on a new substantial
-opening brief or its deliberate retry, with a four-second hook budget, not on
-every turn. Sessions started before this check was installed have no
-opening-brief record.
+or appear in company matches. If the company-wide check cannot finish within
+the four-second hook budget, the opening prompt stops with a visible warning;
+Claustrum warms Cloud authentication in the background and retries when the
+prompt is resent. Public work proceeds only after Cloud confirms the check, or
+when `CLAUSTRUM_DUPLICATE_WORK=0` explicitly disables the protection. Routine
+turns do not contact this endpoint. Sessions started before this check was
+installed have no opening-brief record.
 
 ## Quick Start
 

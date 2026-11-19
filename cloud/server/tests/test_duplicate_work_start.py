@@ -158,7 +158,8 @@ def test_new_session_stays_eligible_after_a_short_first_prompt(local, monkeypatc
 
 def test_clear_reopens_same_session_with_new_opening_id(local, monkeypatch):
     sent = []
-    monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: sent.append(record) or None)
+    monkeypatch.setattr(local, "_should_cloud_send", lambda: True)
+    monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: sent.append(record) or {"match": None})
     assert _prompt(local, monkeypatch, "same", BRIEF)[0] == 0
     monkeypatch.setattr(local, "_cloud_checkin", lambda uid, cwd=None: None)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
@@ -243,6 +244,7 @@ def test_old_local_work_start_schema_migrates_without_losing_fingerprint(local):
 
 def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):
     sent = []
+    monkeypatch.setattr(local, "_should_cloud_send", lambda: True)
 
     def cloud(record, deadline):
         sent.append(record)
@@ -262,6 +264,26 @@ def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):
     assert "plan_path" not in sent[0] and "private" not in sent[0]
     assert _prompt(local, monkeypatch, "new", BRIEF)[0] == 0
     assert len(sent) == 2 and sent[1]["acknowledge"] is True
+
+
+def test_unavailable_company_check_blocks_until_verified(local, monkeypatch):
+    calls = []
+    monkeypatch.setattr(local, "_should_cloud_send", lambda: True)
+    monkeypatch.setattr(local, "_spawn_cloud_sync", lambda uid, cwd: calls.append(("warm", uid)))
+    monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: calls.append(("check", record)) or None)
+
+    code, _, err = _prompt(local, monkeypatch, "new", BRIEF)
+    assert code == 2 and "company-wide check is unavailable" in err
+    assert calls[0][0] == "check" and calls[1] == ("warm", "new")
+    db = local.get_db()
+    assert db.execute("SELECT cloud_checked FROM work_starts WHERE uid = 'new'").fetchone()[0] == 0
+    db.close()
+
+    monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: {"match": None})
+    assert _prompt(local, monkeypatch, "new", BRIEF)[0] == 0
+    db = local.get_db()
+    assert db.execute("SELECT cloud_checked FROM work_starts WHERE uid = 'new'").fetchone()[0] == 1
+    db.close()
 
 
 def test_private_session_never_calls_cloud(local, monkeypatch):

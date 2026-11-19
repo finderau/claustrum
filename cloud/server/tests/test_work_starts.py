@@ -62,6 +62,8 @@ async def test_cross_user_match_and_intentional_retry(api):
         changed = hashlib.sha256((run + ":changed wording").encode()).hexdigest()
         match = (await post(second, f"second-{run}", prompt=changed))["match"]
         assert match["uid"] == f"first-{run}" and match["user_email"] == first
+        retry_after_lost_response = (await post(second, f"second-{run}", prompt=changed))["match"]
+        assert retry_after_lost_response["uid"] == f"first-{run}"
         assert (await post(second, f"second-{run}", prompt=changed, acknowledge=True))["match"] is None
         third = (await post(first, f"third-{run}", prompt=changed))["match"]
         assert third["uid"] == f"second-{run}"
