@@ -22,7 +22,9 @@ Hook integration:
 
 import argparse
 import datetime as _dt
+import functools
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -34,6 +36,7 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from pathlib import Path
 from urllib import request as _urlrequest
 from urllib import parse as _urlparse
@@ -1821,7 +1824,8 @@ def get_db():
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA journal_mode=WAL")
-    _init_schema(db)
+    if db.execute("PRAGMA user_version").fetchone()[0] != _schema_version():
+        _init_schema(db)
     cutoff = time.time() - DUPLICATE_WORK_SECONDS
     if db.execute("SELECT 1 FROM work_starts WHERE first_at < ? LIMIT 1", (cutoff,)).fetchone():
         db.execute("DELETE FROM work_starts WHERE first_at < ?", (cutoff,))
@@ -2053,6 +2057,9 @@ def _init_schema(db):
         # The session's own clean-room env seed, so a sender's delivery routing
         # can apply it when the registry has no row for the recipient.
         ("clean_seed", "INTEGER NOT NULL DEFAULT 0"),
+        # private_explicit: privacy set by a checkin (--private or CLAUSTRUM_PRIVATE), as
+        # opposed to a heartbeat's fail-closed guess. The heartbeat never releases it.
+        ("private_explicit", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -2067,7 +2074,19 @@ def _init_schema(db):
             "WHERE COALESCE(topic_confidence, 0) >= ? AND COALESCE(classify_locked, 0) = 0",
             (CLASSIFY_CONF_FLOOR,),
         )
+    # Rows that predate private_explicit have no record of how they went private, so
+    # treat them all as explicit: the heartbeat must not publish a deliberate choice.
+    if "private_explicit" not in existing:
+        db.execute("UPDATE sessions SET private_explicit = 1 WHERE COALESCE(private, 0) != 0")
+    db.execute(f"PRAGMA user_version = {_schema_version()}")
     db.commit()
+
+
+@functools.lru_cache(maxsize=None)
+def _schema_version():
+    # Derived from _init_schema's source so any schema edit re-runs it once, while
+    # every other connection skips its BEGIN IMMEDIATE write lock.
+    return zlib.crc32(inspect.getsource(_init_schema).encode()) & 0x7FFFFFFF
 
 
 # ---------------------------------------------------------------------------
@@ -3194,32 +3213,48 @@ def _claude_session_id_from_cmd(cmd):
 _PRIVATE_ENV_RE = re.compile(r"(?:^|\s)(?:CLAUSTRUM_PRIVATE=1|WA_PRIVATE_SESSION=1)(?:\s|$)")
 
 
-def _claude_pid_session(pid):
-    """(session_id, private) for a live `claude` process. private is True when
-    the process runs under CLAUSTRUM_PRIVATE / WA_PRIVATE_SESSION, when its
-    session's own row is private, or when its environment can't be read —
-    fail closed, so an adopted placeholder never exposes a private transcript.
-    session_id is None for a bare `claude` (no --session-id/--resume)."""
+def _claude_pid_privacy(pid, db=None):
+    """(session_id, private, known) for a live `claude` process. private is True when
+    the process runs under CLAUSTRUM_PRIVATE / WA_PRIVATE_SESSION or its session's own
+    row is private. known is False when the environment can't be read (no pid, ps
+    failed, or a sandbox hid it); private is then True — fail closed.
+    session_id is None for a bare `claude` (no --session-id/--resume).
+    Pass the caller's open db mid-transaction: a second connection would wait on its
+    write lock and time out into fail-closed."""
     if not pid:
-        return None, True
+        return None, True, False
     try:
-        r = subprocess.run(["ps", "-wwE", "-o", "command=", "-p", str(pid)],
-                           capture_output=True, text=True, timeout=2)
-        out = r.stdout or ""
-        if r.returncode != 0 or "HOME=" not in out:
-            return _claude_session_id_from_cmd(out), True
-        sid = _claude_session_id_from_cmd(out)
-        private = bool(_PRIVATE_ENV_RE.search(out)) and " CLAUSTRUM_PUBLIC=1" not in out
+        def ps(flags):
+            r = subprocess.run(["ps", flags, "-o", "command=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=2)
+            return r.returncode, (r.stdout or "").rstrip("\n")
+        rc_cmd, cmd = ps("-ww")
+        rc_env, out = ps("-wwE")
+        sid = _claude_session_id_from_cmd(cmd)
+        # The environment is only what -E appends past the command line; arguments
+        # (a prompt, say) could otherwise carry HOME= or a privacy variable themselves.
+        env = out[len(cmd):] if rc_cmd == 0 and cmd and out.startswith(cmd) else ""
+        if rc_env != 0 or not re.search(r"(?:^|\s)HOME=", env):
+            return sid, True, False
+        private = bool(_PRIVATE_ENV_RE.search(env)) and not re.search(r"(?:^|\s)CLAUSTRUM_PUBLIC=1(?:\s|$)", env)
         if sid and not private:
-            db = get_db()
+            conn = db or get_db()
             try:
-                row = db.execute("SELECT private FROM sessions WHERE uid = ?", (sid,)).fetchone()
+                row = conn.execute("SELECT private FROM sessions WHERE uid = ?", (sid,)).fetchone()
             finally:
-                db.close()
-            private = bool(row and row["private"])
-        return sid, private
+                if conn is not db:
+                    conn.close()
+            private = bool(row and row[0])
+        return sid, private, True
     except Exception:
-        return None, True
+        return None, True, False
+
+
+def _claude_pid_session(pid):
+    """(session_id, private) for a live `claude` process; private fails closed, so an
+    adopted placeholder never exposes a private transcript."""
+    sid, private, _known = _claude_pid_privacy(pid)
+    return sid, private
 
 
 def _find_claude_transcript_by_pid(pid):
@@ -4551,8 +4586,27 @@ def _emit_clean_collisions(data, collisions):
     _emit_prompt_context(data, output)
 
 
+def _block_duplicate(db, message, update=None):
+    """Exit 2 on a confirmed duplicate even if recording the block fails, so the
+    fail-open handler in main() never lets a real duplicate through."""
+    try:
+        if update:
+            db.execute(*update)
+        db.commit()
+    except Exception as e:
+        print(f"[claustrum error: {e}]", file=sys.stderr)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+    print(message, file=sys.stderr)
+    sys.exit(2)
+
+
 def hook_prompt(_args):
     """UserPromptSubmit — heartbeat, read messages, inject context."""
+    check_notes = []
     work_start_deadline = time.monotonic() + WORK_START_HOOK_BUDGET
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
@@ -4578,11 +4632,7 @@ def hook_prompt(_args):
     elif os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
         previous, record = _record_work_start(db, uid, raw_prompt, now)
         if previous:
-            warning = _duplicate_work_message(dict(previous), now)
-            db.commit()
-            db.close()
-            print(warning, file=sys.stderr)
-            sys.exit(2)
+            _block_duplicate(db, _duplicate_work_message(dict(previous), now))
         if record and _should_cloud_send():
             db.commit()
             cloud_result = _cloud_work_start(record, work_start_deadline)
@@ -4591,26 +4641,18 @@ def hook_prompt(_args):
                     or (cloud_result["match"] is not None
                         and not isinstance(cloud_result["match"], dict))):
                 _spawn_cloud_sync(uid, cwd)
-                db.close()
-                print(
-                    "Claustrum duplicate-work check: the company-wide check is unavailable. "
-                    "This brief is recorded locally, but Cloud has not checked it. "
-                    "Resend the prompt after a moment, or set "
-                    "CLAUSTRUM_DUPLICATE_WORK=0 to work without this protection.",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
+                check_notes.append(
+                    "Claustrum duplicate-work check: the company-wide check is unavailable, "
+                    "so this brief was only checked locally.")
+                cloud_result = {"match": None}
             match = cloud_result.get("match")
             if match and not record["acknowledge"]:
-                db.execute("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
-                           "WHERE opening_id = ?",
+                _block_duplicate(db, _duplicate_work_message(match, now),
+                                 ("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
+                                  "WHERE opening_id = ?", (record["opening_id"],)))
+            elif not check_notes:
+                db.execute("UPDATE work_starts SET cloud_checked = 1 WHERE opening_id = ?",
                            (record["opening_id"],))
-                db.commit()
-                db.close()
-                print(_duplicate_work_message(match, now), file=sys.stderr)
-                sys.exit(2)
-            db.execute("UPDATE work_starts SET cloud_checked = 1 WHERE opening_id = ?",
-                       (record["opening_id"],))
 
     # Auto-set task from user's prompt LOCALLY so same-machine sessions see
     # intent. This stays in SQLite and NEVER leaves the machine.
@@ -4839,7 +4881,7 @@ def hook_prompt(_args):
 
     # Only output if there's something worth reporting (local OR cloud).
     if (not messages and not others and not cloud_lines and not solved_lines
-            and not classify_lines and not inbox_msgs):
+            and not classify_lines and not inbox_msgs and not check_notes):
         _emit_prompt_context(data, "")
         return
 
@@ -4959,6 +5001,10 @@ def hook_prompt(_args):
     if classify_lines:
         parts.append("")
         parts.extend(classify_lines)
+
+    if check_notes:
+        parts.append("")
+        parts.extend(f"  ⚠️  {n}" for n in check_notes)
 
     output = "\n".join(parts)
     _emit_prompt_context(data, output if output.strip() else "")
@@ -5392,8 +5438,8 @@ def cmd_checkin(args):
         """
         INSERT INTO sessions
             (uid, task, working_on, status, cwd, last_seen, started_at,
-             host, tmux_pane, boot_id, private)
-        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+             host, tmux_pane, boot_id, private, private_explicit)
+        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid) DO UPDATE SET
             task = COALESCE(?, task),
             working_on = COALESCE(?, working_on),
@@ -5403,13 +5449,14 @@ def cmd_checkin(args):
             host = COALESCE(?, host),
             tmux_pane = COALESCE(?, tmux_pane),
             boot_id = COALESCE(?, boot_id),
-            private = ?
+            private = ?,
+            private_explicit = ?
         """,
         (
             args.uid, args.task, args.files, args.cwd, now, now,
-            host, pane, boot, private,
+            host, pane, boot, private, private,
             args.task, args.files, args.cwd, now,
-            host, pane, boot, private,
+            host, pane, boot, private, private,
         ),
     )
     # Retire any predecessor rows in this same pane (a relaunch mints a new UID
@@ -5621,19 +5668,36 @@ def cmd_heartbeat(args):
         agent_panes = _live_agent_panes()
         if agent_panes:
             have = {
-                p: (u, pid)
-                for (p, u, pid) in db.execute(
-                    "SELECT tmux_pane, uid, pid FROM sessions "
+                p: (u, pid, priv)
+                for (p, u, pid, priv) in db.execute(
+                    "SELECT tmux_pane, uid, pid, "
+                    "CASE WHEN private_explicit THEN 0 ELSE private END FROM sessions "
                     "WHERE status = 'active' AND tmux_pane IS NOT NULL"
                 ).fetchall()
             }
             for pane, item in agent_panes.items():
                 cpid = item[0]
                 if pane in have:
-                    curr_uid, curr_pid = have[pane]
+                    curr_uid, curr_pid, curr_private = have[pane]
+                    own_placeholder = curr_uid == f"tmux-{host}-{pane}-{cpid}"
+                    # A placeholder pinned private by an unreadable environment is released
+                    # once a read shows the process isn't private.
+                    if own_placeholder and curr_private and item[1] == "claude":
+                        _sid, claude_private, privacy_known = _claude_pid_privacy(cpid, db)
+                        if privacy_known and not claude_private:
+                            released = db.execute(
+                                "UPDATE sessions SET private = 0 "
+                                "WHERE uid = ? AND COALESCE(private_explicit, 0) = 0",
+                                (curr_uid,)).rowcount
+                            # refreshed and live_footer are built in lockstep, so one index
+                            # clears both: the cloud loop publishes it and the footer drops the lock.
+                            for i, r in enumerate(refreshed):
+                                if released and r[0] == curr_uid:
+                                    refreshed[i] = r[:4] + (0,) + r[5:]
+                                    live_footer[i] = (live_footer[i][0], 0)
                     # If the pane is already tracked by a real session (non-placeholder)
                     # or by this process's exact placeholder, skip adoption.
-                    if not curr_uid.startswith("tmux-") or curr_uid == f"tmux-{host}-{pane}-{cpid}":
+                    if not curr_uid.startswith("tmux-") or own_placeholder:
                         continue
                 kind = item[1]
                 pane_cwd = item[2] if len(item) > 2 else None
@@ -5650,7 +5714,11 @@ def cmd_heartbeat(args):
                     tpath = _find_codex_by_pid(cpid)
                 elif kind == "claude":
                     tpath = _find_claude_transcript_by_pid(cpid)
-                pane_private = 1 if kind == "claude" and _claude_pid_session(cpid)[1] else 0
+                if kind == "claude":
+                    _sid, claude_private, privacy_known = _claude_pid_privacy(cpid, db)
+                    pane_private = 1 if claude_private else 0
+                else:
+                    pane_private, privacy_known = 0, True
                 # Record the pane's agent kind on the placeholder. A 'claude'
                 # placeholder is usually a churn stand-in during a relaunch gap
                 # (the real hook session re-registers and classifies itself), so
@@ -5666,8 +5734,14 @@ def cmd_heartbeat(args):
                     "agent=COALESCE(excluded.agent, sessions.agent), "
                     "cwd=COALESCE(excluded.cwd, sessions.cwd), "
                     "transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path), "
-                    "private=MAX(COALESCE(sessions.private, 0), excluded.private)",
-                    (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath, pane_private),
+                    # A read of the process environment decides privacy; an unreadable one
+                    # (e.g. a sandboxed tick) keeps the row's value. Otherwise one failed read
+                    # pins a live session private and hides it from the board for good.
+                    "private=CASE WHEN sessions.private_explicit THEN sessions.private "
+                    "WHEN ? THEN excluded.private "
+                    "ELSE COALESCE(sessions.private, excluded.private) END",
+                    (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath, pane_private,
+                     1 if privacy_known else 0),
                 )
                 _retire_pane_predecessors(db, uid, host, boot, pane)
                 row_private = db.execute(
@@ -7292,14 +7366,9 @@ def main():
             try:
                 handler(args)
             except Exception as e:
+                # Fail open: a broken check must never eat the prompt; only a real
+                # duplicate-work finding blocks.
                 print(f"[claustrum error: {e}]", file=sys.stderr)
-                if (args.event == "prompt" and not _privacy_mode()
-                        and os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower()
-                        not in ("0", "false", "off")):
-                    print("Claustrum duplicate-work check failed. Resend the prompt after "
-                          "the error is resolved, or set CLAUSTRUM_DUPLICATE_WORK=0 "
-                          "to work without this protection.", file=sys.stderr)
-                    sys.exit(2)
         else:
             hook_p.print_help()
 
