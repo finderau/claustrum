@@ -234,12 +234,16 @@ def _clean_registry_event(uid):
     return event
 
 
+def _clean_env_seed():
+    return any(os.environ.get(k, "").strip() == "1"
+               for k in ("CLAUSTRUM_NO_INJECT", "WA_CLEAN_SESSION"))
+
+
 def _clean_room(uid):
     event = _clean_registry_event(uid)
     if event is not None:
         return event == "clean"
-    return any(os.environ.get(k, "").strip() == "1"
-               for k in ("CLAUSTRUM_NO_INJECT", "WA_CLEAN_SESSION"))
+    return _clean_env_seed()
 
 # ---------------------------------------------------------------------------
 # Cloud client — optional cross-machine coordination layer
@@ -918,6 +922,17 @@ def _write_cloud_cache(uid, data):
         os.replace(tmp, path)
     except Exception:
         pass
+
+
+def _unshown_cached_inbox(uid, shown_at):
+    """Inbox messages in the cache that the prompt hook has not displayed: a
+    sync it never showed (clean or stale at the time), or a clean room's
+    carried-over messages, which have no synced_at."""
+    cache = _read_cloud_cache(uid)
+    synced_at = cache.get("synced_at")
+    if synced_at and synced_at <= shown_at:
+        return []
+    return [m for m in cache.get("inbox") or [] if isinstance(m, dict)]
 
 
 def _read_cloud_cache(uid):
@@ -2023,6 +2038,9 @@ def _init_schema(db):
         ("branch", "TEXT"),
         ("repo_root", "TEXT"),
         ("work_start_eligible", "INTEGER NOT NULL DEFAULT 0"),
+        # The session's own clean-room env seed, so a sender's delivery routing
+        # can apply it when the registry has no row for the recipient.
+        ("clean_seed", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -2838,13 +2856,14 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
     # nulled by a later hook that lacks the env (e.g. the machine heartbeat).
     msg_socket = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET") or None
     agent = _agent_kind(label)
+    clean_seed = 1 if _clean_env_seed() else 0
     db.execute(
         """
         INSERT INTO sessions
             (uid, label, status, cwd, last_seen, started_at, last_activity,
              host, tmux_pane, pid, boot_id, private, msg_socket, agent,
-             work_start_eligible)
-        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+             work_start_eligible, clean_seed)
+        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(uid) DO UPDATE SET
             label = COALESCE(?, label),
             status = 'active',
@@ -2857,10 +2876,13 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
             boot_id = COALESCE(?, boot_id),
             private = ?,
             msg_socket = COALESCE(?, msg_socket),
-            agent = COALESCE(?, agent)
+            agent = COALESCE(?, agent),
+            clean_seed = ?
         """,
         (uid, label, cwd, now, now, now, host, pane, pid, boot, private, msg_socket, agent,
-         label, cwd, now, now, host, pane, pid, boot, private, msg_socket, agent),
+         clean_seed,
+         label, cwd, now, now, host, pane, pid, boot, private, msg_socket, agent,
+         clean_seed),
     )
     # Retire any predecessor rows in this same pane (a relaunch mints a new UID
     # but reuses the pane) so one lineage never shows as two sessions.
@@ -4035,14 +4057,16 @@ def _do_cloud_sync(uid, cwd):
     # prompt must not land on a process's visible command line. task/label were
     # stamped into SQLite by the prompt hook before it spawned us.
     task = label = None
+    shown_at = 0
     try:
         db = get_db()
         try:
             row = db.execute(
-                "SELECT task, label FROM sessions WHERE uid = ?", (uid,)
+                "SELECT task, label, inbox_shown_at FROM sessions WHERE uid = ?", (uid,)
             ).fetchone()
             if row:
                 task, label = row["task"], row["label"]
+                shown_at = row["inbox_shown_at"] or 0
         finally:
             db.close()
     except Exception:
@@ -4070,14 +4094,18 @@ def _do_cloud_sync(uid, cwd):
 
     # 2) Cross-machine roster + solved archive + inbox drain. A clean room stays
     #    registered but pulls nothing about other work and leaves its inbox
-    #    undrained for after reconnect; an empty cache also retires any
-    #    snapshot from before it went clean.
+    #    undrained for after reconnect. Its cache keeps only messages already
+    #    drained but not yet shown (no synced_at, so nothing renders), which
+    #    retires any pre-clean snapshot without losing them.
+    pending = _unshown_cached_inbox(uid, shown_at)
     if _clean_room(uid):
-        _write_cloud_cache(uid, {})
+        _write_cloud_cache(uid, {"inbox": pending} if pending else {})
     else:
         list_resp = _cloud_list_peers(uid) or {}
-        inbox_msgs = _cloud_inbox_drain(uid) or []
-        _persist_inbox(uid, inbox_msgs)
+        drained = _cloud_inbox_drain(uid) or []
+        _persist_inbox(uid, drained)
+        seen = {m.get("id") for m in pending if isinstance(m, dict)}
+        inbox_msgs = pending + [m for m in drained if m.get("id") not in seen]
 
         _write_cloud_cache(uid, {
             "synced_at": now,
@@ -4621,7 +4649,8 @@ def hook_prompt(_args):
     cloud_fresh = bool(cache) and (now - (cache.get("synced_at") or 0)) < CLOUD_CACHE_FRESH
 
     # Unread messages for this session (or broadcasts), excluding own. A clean
-    # room leaves them unread, so they surface after reconnect.
+    # room leaves them unread, so directed ones surface after reconnect.
+    # Broadcasts share one read_at, so another session may consume them first.
     messages = [] if clean else db.execute(
         """
         SELECT from_uid, type, body, created_at FROM messages
@@ -6235,14 +6264,17 @@ def _deliver(db, from_uid, to_uid, mtype, body):
         (from_uid, to, mtype, body, time.time()),
     )
     # A clean room reads the row only after reconnect, so it is never pushed.
-    # Registry only: this process's env says nothing about the recipient.
-    if (to and os.environ.get("CLAUSTRUM_SOCKET_PUSH")
-            and _clean_registry_event(to) != "clean"):
+    # This process's env says nothing about the recipient: its registry row
+    # decides, else the env seed it recorded at registration.
+    if to and os.environ.get("CLAUSTRUM_SOCKET_PUSH"):
         row = db.execute(
-            "SELECT msg_socket FROM sessions WHERE uid = ? AND status = 'active'",
+            "SELECT msg_socket, clean_seed FROM sessions "
+            "WHERE uid = ? AND status = 'active'",
             (to,),
         ).fetchone()
-        if row and row["msg_socket"]:
+        event = _clean_registry_event(to)
+        clean = event == "clean" if event is not None else bool(row and row["clean_seed"])
+        if row and row["msg_socket"] and not clean:
             _socket_push(row["msg_socket"], from_uid, body)
 
 

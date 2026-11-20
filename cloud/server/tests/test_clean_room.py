@@ -67,6 +67,11 @@ def cli(tmp_path, monkeypatch):
     monkeypatch.setattr(claustrum, "_close_intents_on_merge", lambda *a, **k: None)
     monkeypatch.setattr(claustrum, "_reap_dead", lambda db, now: [])
     monkeypatch.setattr(claustrum, "_get_session_label", lambda: "clean-room-test")
+    monkeypatch.setattr(claustrum, "_self_rename_if_generic", lambda *a, **k: None)
+    monkeypatch.setattr(claustrum, "_cloud_cache_path",
+                        lambda u: tmp_path / "cloud-cache" / f"{u}.json")
+    monkeypatch.setattr(claustrum, "_inbox_path",
+                        lambda u: tmp_path / "inbox" / f"{u}.json")
     monkeypatch.setenv("CLAUSTRUM_DUPLICATE_WORK", "0")
     return claustrum, calls
 
@@ -257,6 +262,41 @@ def test_directed_message_not_pushed_to_clean_room(cli, monkeypatch):
     assert len(pushed) == 1
     db.commit()
     db.close()
+
+
+def test_env_seeded_recipient_not_pushed_until_reconnected(cli, monkeypatch):
+    m, _ = cli
+    monkeypatch.setenv("CLAUSTRUM_SOCKET_PUSH", "1")
+    pushed = []
+    monkeypatch.setattr(m, "_socket_push", lambda *a: pushed.append(a))
+    db = m.get_db()
+    monkeypatch.setenv("WA_CLEAN_SESSION", "1")
+    m._ensure_session(db, CLEAN_UID, "/tmp/x")
+    monkeypatch.delenv("WA_CLEAN_SESSION")
+    db.execute("UPDATE sessions SET msg_socket = '/tmp/s' WHERE uid = ?", (CLEAN_UID,))
+    m._deliver(db, "peer-uid-2", CLEAN_UID, "info", "I already concluded X")
+    assert pushed == []
+    _register(m, CLEAN_UID, "reconnected")
+    m._deliver(db, "peer-uid-2", CLEAN_UID, "info", "now you can hear me")
+    assert len(pushed) == 1
+    db.close()
+
+
+def test_drained_inbox_survives_going_clean(cli, monkeypatch):
+    m, calls = cli
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+    _register(m, CLEAN_UID, "clean")
+    out = _run_prompt(m, monkeypatch, CLEAN_UID)
+    assert "cross-machine idea" not in out
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+    assert not m._read_cloud_cache(CLEAN_UID).get("synced_at")
+
+    _register(m, CLEAN_UID, "reconnected")
+    monkeypatch.setattr(m, "_cloud_inbox_drain", lambda u: [])
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+    assert "cross-machine idea" in _run_prompt(m, monkeypatch, CLEAN_UID)
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+    assert "cross-machine idea" not in _run_prompt(m, monkeypatch, CLEAN_UID)
 
 
 def test_clean_skips_duplicate_work_check(cli, monkeypatch):
