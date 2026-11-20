@@ -1985,6 +1985,10 @@ def _init_schema(db):
             "WHERE COALESCE(topic_confidence, 0) >= ? AND COALESCE(classify_locked, 0) = 0",
             (CLASSIFY_CONF_FLOOR,),
         )
+    # Rows that predate private_explicit have no record of how they went private, so
+    # treat them all as explicit: the heartbeat must not publish a deliberate choice.
+    if "private_explicit" not in existing:
+        db.execute("UPDATE sessions SET private_explicit = 1 WHERE COALESCE(private, 0) != 0")
     db.execute(f"PRAGMA user_version = {_schema_version()}")
     db.commit()
 
@@ -3135,11 +3139,11 @@ def _claude_pid_privacy(pid, db=None):
         rc_env, out = ps("-wwE")
         sid = _claude_session_id_from_cmd(cmd)
         # The environment is only what -E appends past the command line; arguments
-        # (a prompt, say) could otherwise carry HOME= or CLAUSTRUM_PUBLIC=1 themselves.
+        # (a prompt, say) could otherwise carry HOME= or a privacy variable themselves.
         env = out[len(cmd):] if rc_cmd == 0 and cmd and out.startswith(cmd) else ""
         if rc_env != 0 or not re.search(r"(?:^|\s)HOME=", env):
             return sid, True, False
-        private = bool(_PRIVATE_ENV_RE.search(out)) and not re.search(r"(?:^|\s)CLAUSTRUM_PUBLIC=1(?:\s|$)", env)
+        private = bool(_PRIVATE_ENV_RE.search(env)) and not re.search(r"(?:^|\s)CLAUSTRUM_PUBLIC=1(?:\s|$)", env)
         if sid and not private:
             conn = db or get_db()
             try:
@@ -5544,11 +5548,14 @@ def cmd_heartbeat(args):
                     if own_placeholder and curr_private and item[1] == "claude":
                         _sid, claude_private, privacy_known = _claude_pid_privacy(cpid, db)
                         if privacy_known and not claude_private:
-                            db.execute("UPDATE sessions SET private = 0 WHERE uid = ?", (curr_uid,))
+                            released = db.execute(
+                                "UPDATE sessions SET private = 0 "
+                                "WHERE uid = ? AND COALESCE(private_explicit, 0) = 0",
+                                (curr_uid,)).rowcount
                             # refreshed and live_footer are built in lockstep, so one index
                             # clears both: the cloud loop publishes it and the footer drops the lock.
                             for i, r in enumerate(refreshed):
-                                if r[0] == curr_uid:
+                                if released and r[0] == curr_uid:
                                     refreshed[i] = r[:4] + (0,) + r[5:]
                                     live_footer[i] = (live_footer[i][0], 0)
                     # If the pane is already tracked by a real session (non-placeholder)

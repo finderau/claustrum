@@ -8,6 +8,7 @@ the DB/hook/tick wiring is exercised by hook simulations + the live board.
 
 import importlib.machinery
 import importlib.util
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -379,6 +380,7 @@ def _ps(cmd, env="", rc=0):
     ("claude --session-id {sid} -p", "", 0, True),                     # env unreadable: fail closed
     ("claude --session-id {sid} -p HOME=/u", "", 0, True),             # HOME= in args isn't an env
     ("claude -p HOME=/u CLAUSTRUM_PUBLIC=1", " HOME=/u CLAUSTRUM_PRIVATE=1", 0, True),
+    ("claude --session-id {sid} -p CLAUSTRUM_PRIVATE=1", " HOME=/u", 0, False),  # prompt text, not env
     ("", "", 1, True),
 ])
 def test_claude_pid_session_privacy(monkeypatch, tmp_path, cmd, env, rc, private):
@@ -1389,7 +1391,7 @@ def test_find_transcript_claude_placeholder_resolves_by_pid(tmp_path, monkeypatc
 # --- placeholder privacy follows the process, not one failed read -------------
 
 def _adoption_tick(monkeypatch, tmp_path, row_status, row_private, privacy, published=None, footer=None,
-                   explicit=0):
+                   explicit=0, privacy_fn=None):
     monkeypatch.setattr(cli, "DB_DIR", tmp_path)
     monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr(cli, "_host", lambda: "host1")
@@ -1401,7 +1403,7 @@ def _adoption_tick(monkeypatch, tmp_path, row_status, row_private, privacy, publ
     monkeypatch.setattr(cli, "_pid_alive", lambda pid, boot_id, boot: pid == 10)
     monkeypatch.setattr(cli, "_reap_dead", lambda db, now: [])
     monkeypatch.setattr(cli, "_find_claude_transcript_by_pid", lambda pid: None)
-    monkeypatch.setattr(cli, "_claude_pid_privacy", lambda pid, db=None: privacy)
+    monkeypatch.setattr(cli, "_claude_pid_privacy", privacy_fn or (lambda pid, db=None: privacy))
     for name in dir(cli):
         if name.startswith("_cloud_"):
             monkeypatch.setattr(cli, name, lambda *a, **k: None)
@@ -1451,6 +1453,34 @@ def test_readable_public_process_keeps_an_explicitly_private_placeholder(monkeyp
     assert _adoption_tick(monkeypatch, tmp_path, status, 1, ("sid", False, True), published,
                           explicit=1) == 1
     assert published == []
+
+
+def test_concurrent_explicit_checkin_survives_a_release(monkeypatch, tmp_path):
+    def privacy_then_checkin(pid, db=None):
+        other = sqlite3.connect(str(tmp_path / "state.db"))
+        other.execute("UPDATE sessions SET private_explicit = 1 WHERE uid = 'tmux-host1-%33-10'")
+        other.commit()
+        other.close()
+        return ("sid", False, True)
+    published = []
+    private = _adoption_tick(monkeypatch, tmp_path, "active", 1, None, published,
+                             privacy_fn=privacy_then_checkin)
+    assert private == 1
+    assert published == []
+
+
+def test_migration_treats_existing_private_rows_as_explicit(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    db = cli.get_db()
+    db.execute("ALTER TABLE sessions DROP COLUMN private_explicit")
+    db.execute("INSERT INTO sessions (uid, status, last_seen, started_at, private) "
+               "VALUES ('tmux-h-%1-5', 'active', 0, 0, 1), ('tmux-h-%2-6', 'active', 0, 0, 0)")
+    db.commit()
+    cli._init_schema(db)
+    rows = dict(db.execute("SELECT uid, private_explicit FROM sessions").fetchall())
+    db.close()
+    assert rows == {"tmux-h-%1-5": 1, "tmux-h-%2-6": 0}
 
 
 def test_released_placeholder_is_published_and_unlocked_in_the_same_tick(monkeypatch, tmp_path):
