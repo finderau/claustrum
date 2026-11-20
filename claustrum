@@ -1968,6 +1968,9 @@ def _init_schema(db):
         ("branch", "TEXT"),
         ("repo_root", "TEXT"),
         ("work_start_eligible", "INTEGER NOT NULL DEFAULT 0"),
+        # private_explicit: privacy set by a checkin (--private or CLAUSTRUM_PRIVATE), as
+        # opposed to a heartbeat's fail-closed guess. The heartbeat never releases it.
+        ("private_explicit", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -3124,13 +3127,19 @@ def _claude_pid_privacy(pid, db=None):
     if not pid:
         return None, True, False
     try:
-        r = subprocess.run(["ps", "-wwE", "-o", "command=", "-p", str(pid)],
-                           capture_output=True, text=True, timeout=2)
-        out = r.stdout or ""
-        if r.returncode != 0 or "HOME=" not in out:
-            return _claude_session_id_from_cmd(out), True, False
-        sid = _claude_session_id_from_cmd(out)
-        private = bool(_PRIVATE_ENV_RE.search(out)) and " CLAUSTRUM_PUBLIC=1" not in out
+        def ps(flags):
+            r = subprocess.run(["ps", flags, "-o", "command=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=2)
+            return r.returncode, (r.stdout or "").rstrip("\n")
+        rc_cmd, cmd = ps("-ww")
+        rc_env, out = ps("-wwE")
+        sid = _claude_session_id_from_cmd(cmd)
+        # The environment is only what -E appends past the command line; arguments
+        # (a prompt, say) could otherwise carry HOME= or CLAUSTRUM_PUBLIC=1 themselves.
+        env = out[len(cmd):] if rc_cmd == 0 and cmd and out.startswith(cmd) else ""
+        if rc_env != 0 or not re.search(r"(?:^|\s)HOME=", env):
+            return sid, True, False
+        private = bool(_PRIVATE_ENV_RE.search(out)) and not re.search(r"(?:^|\s)CLAUSTRUM_PUBLIC=1(?:\s|$)", env)
         if sid and not private:
             conn = db or get_db()
             try:
@@ -5288,8 +5297,8 @@ def cmd_checkin(args):
         """
         INSERT INTO sessions
             (uid, task, working_on, status, cwd, last_seen, started_at,
-             host, tmux_pane, boot_id, private)
-        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
+             host, tmux_pane, boot_id, private, private_explicit)
+        VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(uid) DO UPDATE SET
             task = COALESCE(?, task),
             working_on = COALESCE(?, working_on),
@@ -5299,13 +5308,14 @@ def cmd_checkin(args):
             host = COALESCE(?, host),
             tmux_pane = COALESCE(?, tmux_pane),
             boot_id = COALESCE(?, boot_id),
-            private = ?
+            private = ?,
+            private_explicit = ?
         """,
         (
             args.uid, args.task, args.files, args.cwd, now, now,
-            host, pane, boot, private,
+            host, pane, boot, private, private,
             args.task, args.files, args.cwd, now,
-            host, pane, boot, private,
+            host, pane, boot, private, private,
         ),
     )
     # Retire any predecessor rows in this same pane (a relaunch mints a new UID
@@ -5519,7 +5529,8 @@ def cmd_heartbeat(args):
             have = {
                 p: (u, pid, priv)
                 for (p, u, pid, priv) in db.execute(
-                    "SELECT tmux_pane, uid, pid, private FROM sessions "
+                    "SELECT tmux_pane, uid, pid, "
+                    "CASE WHEN private_explicit THEN 0 ELSE private END FROM sessions "
                     "WHERE status = 'active' AND tmux_pane IS NOT NULL"
                 ).fetchall()
             }
@@ -5582,7 +5593,8 @@ def cmd_heartbeat(args):
                     # A read of the process environment decides privacy; an unreadable one
                     # (e.g. a sandboxed tick) keeps the row's value. Otherwise one failed read
                     # pins a live session private and hides it from the board for good.
-                    "private=CASE WHEN ? THEN excluded.private "
+                    "private=CASE WHEN sessions.private_explicit THEN sessions.private "
+                    "WHEN ? THEN excluded.private "
                     "ELSE COALESCE(sessions.private, excluded.private) END",
                     (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath, pane_private,
                      1 if privacy_known else 0),
