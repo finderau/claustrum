@@ -25,8 +25,9 @@ Claude doesn't *decide* to coordinate. It just *perceives* the coordination stat
 User hits Enter
        │
        ▼
-UserPromptSubmit hook fires   (local-only — never blocks on the network)
+UserPromptSubmit hook fires   (local; one cloud call on a substantial opening brief)
        │
+       ├──→ One-time duplicate-brief check (may stop a repeated opening prompt)
        ├──→ Heartbeat (I'm alive)
        ├──→ Read messages (what should I know?)
        ├──→ Check nearby sessions (who else is working?)
@@ -54,6 +55,31 @@ PostToolUse hook on Edit/Write
 ```
 
 The backing store is a single SQLite file (`~/.claustrum/state.db`) in WAL mode. No daemon. No server. Each session reads and writes directly. SQLite handles the concurrency.
+
+### Duplicate opening briefs
+
+Claustrum keeps a seven-day record of each session opening's first substantial
+prompt. `/clear` starts a new opening while retaining earlier fingerprints.
+A new session with the same prompt, or the same Markdown plan and branch named
+in its prompt, stops once at `UserPromptSubmit` and shows the earlier session.
+This catches a repeated seed even when the first session has exited, its live
+row has been reaped, its topic differs, or both sessions use the same worktree
+and PR. After reviewing the earlier session and its PR, resend the prompt to
+continue an intentional handoff. `CLAUSTRUM_DUPLICATE_WORK=0` disables this
+check.
+
+The local SQLite record contains a prompt hash, plan path, branch, label and
+timestamp. Public sessions also send the opaque prompt hash and a hash of the
+canonical repo, repo-relative plan path and branch to Claustrum Cloud. No prompt
+text or absolute path is sent. Cloud compares briefs across all authenticated
+users, regardless of machine or topic. Private sessions never call this endpoint
+or appear in company matches. If the company-wide check cannot finish within
+the four-second hook budget, the opening prompt stops with a visible warning;
+Claustrum warms Cloud authentication in the background and retries when the
+prompt is resent. Public work proceeds only after Cloud confirms the check, or
+when `CLAUSTRUM_DUPLICATE_WORK=0` explicitly disables the protection. Routine
+turns do not contact this endpoint. Sessions started before this check was
+installed have no opening-brief record.
 
 ## Quick Start
 
@@ -301,6 +327,7 @@ environment. Unset = exact prior single-machine behaviour.
 | `CLAUSTRUM_AUTH_VALUE` | Static header value (e.g. `Bearer <token>`). Use for long-lived credentials. |
 | `CLAUSTRUM_AUTH_COMMAND` | Shell command whose stdout becomes the header value. Runs per request — wrap `gcloud auth print-identity-token` (or any token producer) with caching for short-lived tokens. Takes precedence over `CLAUSTRUM_AUTH_VALUE`. |
 | `CLAUSTRUM_OVERLAP_GATE` | `0` turns off the one-time pre-work overlap gate (default on). The gate needs no cloud for the open-PR check; with no cloud it only sees PRs. |
+| `CLAUSTRUM_DUPLICATE_WORK` | `0` turns off the local duplicate opening-brief check (default on). |
 | `CLAUSTRUM_FORCE` | `1` forces the session: it edits through other sessions' file claims, holds none of its own, and skips the overlap gate, but still publishes. Per tmux pane, `tmux set -p @claustrum-force 1` does the same and can be flipped mid-session (Conductor's force toggle uses it). |
 | `CLAUSTRUM_PLAN_INTENTS` | `0` stops leaving plan mode from auto-registering the plan as an intent (default on; sensitive-looking headings are always skipped). |
 | `CLAUSTRUM_CLASSIFY_CMD` | The LLM judge behind the **classification skill**: a command fed `{"mode","signal","candidates"}` JSON on stdin that prints `{"choice","is_new","description"}` — pick an existing domain/topic or propose a new one. Called (detached) by the turn-3 hook + the `heartbeat` tick, twice per run (domain then topic). LLM-agnostic (any cheap CLI); run with `CLAUSTRUM_PRIVATE=1`. Unset = no skill (in-session directive + heuristic floor only). |

@@ -46,6 +46,7 @@ authenticated proxy.
 | GET | `/healthz` | Liveness — no DB |
 | GET | `/readyz` | Readiness — `SELECT 1` |
 | POST | `/v1/checkin` | Register or refresh a session |
+| POST | `/v1/work-start` | Atomically record a public opening-brief fingerprint and return a recent company-wide match; retry with `acknowledge=true` for an intentional handoff |
 | POST | `/v1/update` | Update task / working_on / status / files / PR (detail layer) |
 | GET | `/v1/list` | Per-turn peer query — tiered overlap dedup, server-side filtered; also returns matching `solved` work and other people's open `intents` (`include_intents=false` to skip) |
 | POST | `/v1/intents` | Declare planned work (title, repo, paths, topic, uid, PR). Idempotent per person+repo+title (re-declaring unions paths, refreshes expiry) |
@@ -61,8 +62,8 @@ authenticated proxy.
 | GET | `/v1/archive` | Browse the solved-problem archive — all `done` resolution-bearing sessions, any age, paginated (limit/offset, hot+cold) |
 | GET | `/v1/resume_check` | What changed while paused (peer activity, merged PRs, expired claims) |
 | GET | `/v1/inbox_drain` | Atomically fetch + mark-delivered pending messages |
-| POST | `/v1/reset` | Per-user wipe (sessions, proposals, intents, own claims + sent messages) |
-| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused for dead / >24h abandoned sessions, expire claims, purge intents closed/lapsed >90d) |
+| POST | `/v1/reset` | Per-user wipe (sessions, proposals, intents, opening fingerprints, own claims + sent messages) |
+| POST | `/jobs/state-transitions` | Cloud Scheduler — 5-min (active→paused for dead / >24h abandoned sessions, expire claims, purge intents closed/lapsed >90d and opening fingerprints >7d) |
 | POST | `/jobs/topic-concentration` | Cloud Scheduler — hourly (≥3 active on a topic → alert) |
 | POST | `/jobs/validate-proposals` | Cloud Scheduler — hourly proposal-table cleanup (promotion now happens inline at propose time; this resolves any legacy/open rows) |
 | POST | `/jobs/archive-cold` | Cloud Scheduler — daily (move cold rows → `sessions_archive`; copy-not-delete, no BQ) |

@@ -22,6 +22,7 @@ Hook integration:
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
 import re
@@ -30,7 +31,9 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 from urllib import request as _urlrequest
 from urllib import parse as _urlparse
@@ -44,6 +47,7 @@ DB_DIR = Path.home() / ".claustrum"
 DB_PATH = DB_DIR / "state.db"
 STALE_SECONDS = 432000   # 5 days without heartbeat = stale
 CLEANUP_SECONDS = 432000 # 5 days = remove done/stale sessions
+DUPLICATE_WORK_SECONDS = 604800  # recent opening briefs remain visible after a session exits
 ABANDONED_ACTIVE_SECONDS = 86400  # 24h: inactive sessions drop to paused
 PLACEHOLDER_SETTLE_SECONDS = 600  # a tmux- placeholder the hook hasn't replaced by now is the session
 
@@ -72,13 +76,15 @@ DISPLAY_CLASH_MAX = 4
 CLOUD_TIMEOUT = 1.5
 CLOUD_TIMEOUT_INTERACTIVE = 8.0
 
-# The prompt hook no longer blocks on the cloud: it spawns a detached
+# Routine prompt work does not block on the cloud: it spawns a detached
 # `cloud-sync` worker and renders from that worker's last result (the cloud
-# cache). CLOUD_CACHE_FRESH is how long that cached result stays trustworthy —
+# cache). A new substantial brief makes one bounded duplicate-work check.
+# CLOUD_CACHE_FRESH is how long that cached result stays trustworthy —
 # older than this and the tray treats the cloud as "unknown" (no stale
 # cross-machine tiers, no classify/drift directives) until the next sync lands.
 # Comfortably covers a slow-typing user's turn cadence.
 CLOUD_CACHE_FRESH = 180.0
+WORK_START_HOOK_BUDGET = 4.0
 
 # Classify directive tuning. A deliberate sub-agent/human classify-self writes
 # confidence 80; the local keyword heuristic caps at 60 and the tick floor is
@@ -236,14 +242,14 @@ def _print_private_banner_once():
     sys.stderr.flush()
 
 
-def _resolve_auth():
+def _resolve_auth(timeout=10):
     """Return (header_name, header_value) or None if no auth configured."""
     header = os.environ.get("CLAUSTRUM_AUTH_HEADER", "").strip() or "Authorization"
     cmd = os.environ.get("CLAUSTRUM_AUTH_COMMAND", "").strip()
     if cmd:
         try:
             result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=10,
+                cmd, shell=True, capture_output=True, text=True, timeout=timeout,
             )
             value = result.stdout.strip()
             if value:
@@ -323,7 +329,7 @@ def _ssl_context():
     return _SSL_CTX
 
 
-def _cloud_request(method, path, body=None, params=None, timeout=None):
+def _cloud_request(method, path, body=None, params=None, timeout=None, auth_timeout=10):
     """Synchronous best-effort HTTP request. Returns dict on success, None
     on any failure. Caller has already gated on _should_cloud_send."""
     url = _cloud_url()
@@ -339,7 +345,7 @@ def _cloud_request(method, path, body=None, params=None, timeout=None):
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    auth = _resolve_auth()
+    auth = _resolve_auth(timeout=auth_timeout)
     if auth:
         headers[auth[0]] = auth[1]
     req = _urlrequest.Request(full, data=data, headers=headers, method=method)
@@ -1727,14 +1733,19 @@ def get_db():
     DB_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(DB_PATH), timeout=5)
     db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=5000")
+    db.execute("PRAGMA journal_mode=WAL")
     _init_schema(db)
+    cutoff = time.time() - DUPLICATE_WORK_SECONDS
+    if db.execute("SELECT 1 FROM work_starts WHERE first_at < ? LIMIT 1", (cutoff,)).fetchone():
+        db.execute("DELETE FROM work_starts WHERE first_at < ?", (cutoff,))
+        db.commit()
     return db
 
 
 def _init_schema(db):
     db.executescript("""
+        BEGIN IMMEDIATE;
         CREATE TABLE IF NOT EXISTS sessions (
             uid          TEXT PRIMARY KEY,
             label        TEXT,
@@ -1799,6 +1810,25 @@ def _init_schema(db):
             shown_at     REAL NOT NULL,
             PRIMARY KEY (uid, item)
         );
+
+        CREATE TABLE IF NOT EXISTS work_starts (
+            opening_id   TEXT PRIMARY KEY,
+            uid          TEXT NOT NULL,
+            first_at     REAL NOT NULL,
+            prompt_hash  TEXT NOT NULL,
+            plan_path    TEXT,
+            plan_key     TEXT,
+            repo         TEXT,
+            branch       TEXT,
+            label        TEXT,
+            private      INTEGER NOT NULL DEFAULT 0,
+            acknowledged INTEGER NOT NULL DEFAULT 1,
+            cloud_checked INTEGER NOT NULL DEFAULT 0,
+            cloud_acknowledge INTEGER NOT NULL DEFAULT 0,
+            is_current   INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_work_starts_first_at
+            ON work_starts(first_at);
     """)
     # Migrate older DBs: add liveness columns if missing. Existing rows get
     # NULLs and fall back to the timer until their next heartbeat repopulates
@@ -1822,6 +1852,42 @@ def _init_schema(db):
     # a session classifies once and is never auto-revisited); the columns are kept
     # so existing DBs don't error and are zeroed on an explicit reclassify.
     existing = {r["name"] for r in db.execute("PRAGMA table_info(sessions)")}
+    work_start_columns = {r["name"] for r in db.execute("PRAGMA table_info(work_starts)")}
+    for col, decl in (("opening_id", "TEXT"), ("plan_key", "TEXT"), ("repo", "TEXT"),
+                      ("acknowledged", "INTEGER NOT NULL DEFAULT 1"),
+                      ("cloud_checked", "INTEGER NOT NULL DEFAULT 0"),
+                      ("cloud_acknowledge", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in work_start_columns:
+            db.execute(f"ALTER TABLE work_starts ADD COLUMN {col} {decl}")
+    old_key = [r["name"] for r in db.execute("PRAGMA table_info(work_starts)") if r["pk"]]
+    if old_key == ["uid"]:
+        db.execute("ALTER TABLE work_starts RENAME TO work_starts_old")
+        db.execute("""
+            CREATE TABLE work_starts (
+                opening_id TEXT PRIMARY KEY, uid TEXT NOT NULL,
+                first_at REAL NOT NULL, prompt_hash TEXT NOT NULL,
+                plan_path TEXT, plan_key TEXT, repo TEXT, branch TEXT,
+                label TEXT, private INTEGER NOT NULL DEFAULT 0,
+                acknowledged INTEGER NOT NULL DEFAULT 1,
+                cloud_checked INTEGER NOT NULL DEFAULT 0,
+                cloud_acknowledge INTEGER NOT NULL DEFAULT 0,
+                is_current INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        db.execute("""
+            INSERT INTO work_starts
+                (opening_id, uid, first_at, prompt_hash, plan_path, plan_key,
+                 repo, branch, label, private, acknowledged, cloud_checked,
+                 cloud_acknowledge)
+            SELECT COALESCE(opening_id, uid), uid, first_at, prompt_hash,
+                   plan_path, plan_key, repo, branch, label, private, acknowledged,
+                   cloud_checked, cloud_acknowledge
+            FROM work_starts_old
+        """)
+        db.execute("DROP TABLE work_starts_old")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_work_starts_first_at ON work_starts(first_at)")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_work_starts_current "
+               "ON work_starts(uid) WHERE is_current = 1")
     for col, decl in (
         ("host", "TEXT"),
         ("tmux_pane", "TEXT"),
@@ -1897,6 +1963,7 @@ def _init_schema(db):
         ("repo", "TEXT"),
         ("branch", "TEXT"),
         ("repo_root", "TEXT"),
+        ("work_start_eligible", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if col not in existing:
             db.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
@@ -2716,8 +2783,9 @@ def _ensure_session(db, uid, cwd=None, inherit_classification=True):
         """
         INSERT INTO sessions
             (uid, label, status, cwd, last_seen, started_at, last_activity,
-             host, tmux_pane, pid, boot_id, private, msg_socket, agent)
-        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             host, tmux_pane, pid, boot_id, private, msg_socket, agent,
+             work_start_eligible)
+        VALUES (?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(uid) DO UPDATE SET
             label = COALESCE(?, label),
             status = 'active',
@@ -4213,12 +4281,148 @@ def _build_classify_block(uid, transcript_path=None):
 # ---------------------------------------------------------------------------
 # Hook handlers  (read JSON from stdin, interact with DB, write to stdout)
 #
-# IMPORTANT: hooks must never crash. A broken hook blocks the user's prompt.
-# Every handler is wrapped in try/except at the dispatch level.
+# Hook errors are caught at dispatch. Public prompt errors block while the
+# duplicate-work check is enabled, because the opening cannot be verified.
 # ---------------------------------------------------------------------------
+
+_OPENING_PLAN_RE = re.compile(r"(/[\w./-]+\.md)\b", re.IGNORECASE)
+_OPENING_BRANCH_RE = re.compile(r"\b(?:local\s+)?branch\s+[`\"']?([\w./-]+)", re.IGNORECASE)
+
+
+def _record_work_start(db, uid, raw_prompt, now):
+    """Keep the first substantial brief after the session row has been reaped."""
+    if (uid == "unknown" or len(raw_prompt.strip()) < 120
+            or _is_harness_prompt(raw_prompt)):
+        return None, None
+    existing = db.execute(
+        "SELECT * FROM work_starts WHERE uid = ? AND is_current = 1", (uid,)
+    ).fetchone()
+    if existing and existing["acknowledged"]:
+        if existing["private"] or existing["cloud_checked"] or not _should_cloud_send():
+            return None, None
+        return None, {
+            "uid": uid, "opening_id": existing["opening_id"],
+            "machine": _host(), "label": existing["label"],
+            "prompt_hash": existing["prompt_hash"], "plan_key": existing["plan_key"],
+            "repo": existing["repo"], "branch": existing["branch"],
+            "acknowledge": bool(existing["cloud_acknowledge"]),
+        }
+
+    normalized = " ".join(raw_prompt.split()).casefold()
+    prompt_hash = hashlib.sha256(normalized.encode()).hexdigest()
+    plan = _OPENING_PLAN_RE.search(raw_prompt)
+    branch = _OPENING_BRANCH_RE.search(raw_prompt)
+    plan_path = os.path.normpath(plan.group(1)) if plan else None
+    branch_name = branch.group(1).rstrip(".,;)") if branch else None
+    repo = plan_key = None
+    if plan_path and os.path.isfile(plan_path):
+        repo, checkout_branch = _git_info(os.path.dirname(plan_path))
+        root = _git_toplevel(os.path.dirname(plan_path))
+        branch_name = branch_name or checkout_branch
+        if repo and root and branch_name:
+            rel = os.path.relpath(os.path.realpath(plan_path), os.path.realpath(root))
+            if not rel.startswith(".."):
+                key = f"{repo.casefold()}:{rel.replace(os.sep, '/').casefold()}:{branch_name.casefold()}"
+                plan_key = hashlib.sha256(key.encode()).hexdigest()
+    private = 1 if _privacy_mode() else 0
+    if existing:
+        same_opening = existing["private"] == private and (
+            existing["prompt_hash"] == prompt_hash
+            or (plan_key and existing["plan_key"] == plan_key)
+            or (plan_path and branch_name and existing["plan_path"] == plan_path
+                and existing["branch"] == branch_name)
+        )
+        if same_opening:
+            db.execute("UPDATE work_starts SET acknowledged = 1, "
+                       "cloud_checked = 0, cloud_acknowledge = 1 WHERE opening_id = ?",
+                       (existing["opening_id"],))
+            return None, {
+                "uid": uid, "opening_id": existing["opening_id"] or uid,
+                "machine": _host(), "label": existing["label"],
+                "prompt_hash": existing["prompt_hash"], "plan_key": existing["plan_key"],
+                "repo": existing["repo"], "branch": existing["branch"],
+                "acknowledge": True,
+            }
+        db.execute("UPDATE work_starts SET is_current = 0 WHERE opening_id = ?",
+                   (existing["opening_id"],))
+        db.execute("UPDATE sessions SET work_start_eligible = 1 WHERE uid = ?", (uid,))
+    eligibility = db.execute(
+        "SELECT COALESCE(work_start_eligible, 0) FROM sessions WHERE uid = ?", (uid,)
+    ).fetchone()
+    if not eligibility or not eligibility[0]:
+        return None, None
+    previous = db.execute(
+        "SELECT w.uid, COALESCE(s.label, w.label) AS label, w.first_at, "
+        "w.plan_path, w.branch FROM work_starts w "
+        "LEFT JOIN sessions s ON s.uid = w.uid "
+        "WHERE w.private = ? AND w.acknowledged = 1 "
+        "AND w.first_at >= ? "
+        "AND (w.prompt_hash = ? OR (? IS NOT NULL AND ? IS NOT NULL "
+        "AND w.plan_path = ? AND w.branch = ?) "
+        "OR (? IS NOT NULL AND w.plan_key = ?)) "
+        "ORDER BY w.first_at DESC LIMIT 1",
+        (private, now - DUPLICATE_WORK_SECONDS, prompt_hash,
+         plan_path, branch_name, plan_path, branch_name, plan_key, plan_key),
+    ).fetchone()
+    label = _get_session_label()
+    opening_id = uuid.uuid4().hex
+    db.execute(
+        "INSERT INTO work_starts "
+        "(opening_id, uid, first_at, prompt_hash, plan_path, plan_key, repo, branch, "
+        "label, private, acknowledged, cloud_checked) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (opening_id, uid, now, prompt_hash, plan_path, plan_key, repo,
+         branch_name, label, private, 0 if previous else 1, private),
+    )
+    db.execute("UPDATE sessions SET work_start_eligible = 0 WHERE uid = ?", (uid,))
+    return previous, {
+        "uid": uid, "opening_id": opening_id, "machine": _host(), "label": label,
+        "prompt_hash": prompt_hash, "plan_key": plan_key,
+        "repo": repo, "branch": branch_name, "acknowledge": False,
+    }
+
+
+def _cloud_work_start(record, deadline):
+    if not _should_cloud_send():
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    result = {}
+
+    def submit():
+        result["response"] = _cloud_request(
+            "POST", "/v1/work-start", body=record,
+            timeout=min(2, remaining), auth_timeout=min(2, remaining),
+        )
+
+    worker = threading.Thread(target=submit, daemon=True)
+    worker.start()
+    worker.join(remaining)
+    return result.get("response")
+
+
+def _duplicate_work_message(previous, now):
+    label = previous["label"] or previous["uid"][:12]
+    started = previous["first_at"]
+    if isinstance(started, str):
+        started = _dt.datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp()
+    ago = _format_ago(now - started)
+    owner = f" by {previous['user_email']}" if previous.get("user_email") else ""
+    where = (f" ({previous['repo']}, branch {previous['branch']})"
+             if previous.get("repo") and previous.get("branch") else "")
+    return (
+        f"Claustrum duplicate-work check: this opening brief matches an earlier "
+        f"session, {label}{owner} ({ago} ago){where}.\n"
+        "STOP: review that session's progress and any existing PR before doing "
+        "the work again. If this is an intentional handoff, resend the prompt "
+        "after reviewing it."
+    )
+
 
 def hook_prompt(_args):
     """UserPromptSubmit — heartbeat, read messages, inject context."""
+    work_start_deadline = time.monotonic() + WORK_START_HOOK_BUDGET
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
     cwd = data.get("cwd")
@@ -4233,6 +4437,43 @@ def hook_prompt(_args):
     # Reap dead same-host sessions (and release their stale claims) using
     # tmux/boot ground truth, so the roster below reflects who's actually alive.
     _reap_dead(db, now)
+
+    if os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
+        previous, record = _record_work_start(db, uid, raw_prompt, now)
+        if previous:
+            warning = _duplicate_work_message(dict(previous), now)
+            db.commit()
+            db.close()
+            print(warning, file=sys.stderr)
+            sys.exit(2)
+        if record and _should_cloud_send():
+            db.commit()
+            cloud_result = _cloud_work_start(record, work_start_deadline)
+            if (not isinstance(cloud_result, dict)
+                    or "match" not in cloud_result
+                    or (cloud_result["match"] is not None
+                        and not isinstance(cloud_result["match"], dict))):
+                _spawn_cloud_sync(uid, cwd)
+                db.close()
+                print(
+                    "Claustrum duplicate-work check: the company-wide check is unavailable. "
+                    "This brief is recorded locally, but Cloud has not checked it. "
+                    "Resend the prompt after a moment, or set "
+                    "CLAUSTRUM_DUPLICATE_WORK=0 to work without this protection.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            match = cloud_result.get("match")
+            if match and not record["acknowledge"]:
+                db.execute("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
+                           "WHERE opening_id = ?",
+                           (record["opening_id"],))
+                db.commit()
+                db.close()
+                print(_duplicate_work_message(match, now), file=sys.stderr)
+                sys.exit(2)
+            db.execute("UPDATE work_starts SET cloud_checked = 1 WHERE opening_id = ?",
+                       (record["opening_id"],))
 
     # Auto-set task from user's prompt LOCALLY so same-machine sessions see
     # intent. This stays in SQLite and NEVER leaves the machine.
@@ -4273,7 +4514,7 @@ def hook_prompt(_args):
             (transcript_path, uid),
         )
 
-    # Cloud data is NON-BLOCKING: the actual write-through (checkin + topic
+    # Routine cloud data is NON-BLOCKING: the actual write-through (checkin + topic
     # mirror + peer roster + inbox drain — all the slow IAP/network work) runs in
     # a detached `cloud-sync` worker spawned at the end of this hook. Here we
     # only READ that worker's last result from the cloud cache, so the hook never
@@ -4764,9 +5005,12 @@ def hook_start(_args):
     if not inherit_cls:
         # A cleared session starts afresh: reset turn_count and any prior
         # classification metadata in case this UID was reused.
+        db.execute("UPDATE work_starts SET is_current = 0 WHERE uid = ? AND is_current = 1",
+                   (uid,))
         db.execute(
             "UPDATE sessions SET "
-            "turn_count = 0, topic = NULL, domain = NULL, topic_confidence = NULL, "
+            "turn_count = 0, work_start_eligible = 1, "
+            "topic = NULL, domain = NULL, topic_confidence = NULL, "
             "task = NULL, working_on = NULL, end_reason = NULL, classify_locked = 0, "
             "classify_prompted = 0, classify_attempts = 0, classify_failed = 0, "
             "classify_spawned_at = NULL, classify_error = NULL, "
@@ -6426,7 +6670,8 @@ def cmd_reset(args):
     db = get_db()
     db.executescript(
         "DELETE FROM sessions; DELETE FROM messages; DELETE FROM claims; "
-        "DELETE FROM overlap_gate_runs; DELETE FROM overlap_shown;"
+        "DELETE FROM overlap_gate_runs; DELETE FROM overlap_shown; "
+        "DELETE FROM work_starts;"
     )
     db.close()
     print("Claustrum reset. All sessions, messages, and claims cleared.")
@@ -6904,9 +7149,14 @@ def main():
             try:
                 handler(args)
             except Exception as e:
-                # Hooks must never crash — fail silently rather than
-                # block the user's prompt or tool call
                 print(f"[claustrum error: {e}]", file=sys.stderr)
+                if (args.event == "prompt" and not _privacy_mode()
+                        and os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower()
+                        not in ("0", "false", "off")):
+                    print("Claustrum duplicate-work check failed. Resend the prompt after "
+                          "the error is resolved, or set CLAUSTRUM_DUPLICATE_WORK=0 "
+                          "to work without this protection.", file=sys.stderr)
+                    sys.exit(2)
         else:
             hook_p.print_help()
 
