@@ -129,6 +129,9 @@ def test_old_brief_expires_and_opt_out_works(local, monkeypatch):
                (local.DUPLICATE_WORK_SECONDS + 1,))
     db.commit()
     db.close()
+    db = local.get_db()
+    assert db.execute("SELECT 1 FROM work_starts WHERE uid = 'first'").fetchone() is None
+    db.close()
     assert _prompt(local, monkeypatch, "second", BRIEF)[0] == 0
     monkeypatch.setenv("CLAUSTRUM_DUPLICATE_WORK", "0")
     assert _prompt(local, monkeypatch, "third", BRIEF)[0] == 0
@@ -223,7 +226,7 @@ def test_old_local_work_start_schema_migrates_without_losing_fingerprint(local):
     )
     db.execute(
         "INSERT INTO work_starts (uid, first_at, prompt_hash, private, acknowledged) "
-        "VALUES ('old', 100, 'abc', 1, 1)"
+        "VALUES ('old', ?, 'abc', 1, 1)", (time.time() - 100,)
     )
     db.commit()
     db.close()
@@ -290,6 +293,30 @@ def test_private_session_never_calls_cloud(local, monkeypatch):
     monkeypatch.setenv("CLAUSTRUM_PRIVATE", "1")
     monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: pytest.fail("private cloud call"))
     assert _prompt(local, monkeypatch, "private", BRIEF)[0] == 0
+
+
+@pytest.mark.parametrize("privacy,disabled,expected", [
+    (False, False, 2),
+    (True, False, 0),
+    (False, True, 0),
+])
+def test_prompt_hook_db_error_blocks_public_work(local, monkeypatch, privacy, disabled, expected):
+    def locked_db(_args):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(local, "hook_prompt", locked_db)
+    monkeypatch.setattr(sys, "argv", ["claustrum", "hook", "prompt"])
+    if privacy:
+        monkeypatch.setenv("CLAUSTRUM_PRIVATE", "1")
+    if disabled:
+        monkeypatch.setenv("CLAUSTRUM_DUPLICATE_WORK", "0")
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        with pytest.raises(SystemExit) if expected else contextlib.nullcontext() as exit_info:
+            local.main()
+    if expected:
+        assert exit_info.value.code == expected
+        assert "duplicate-work check failed" in err.getvalue()
 
 
 def test_cloud_work_start_respects_prompt_deadline(local, monkeypatch):

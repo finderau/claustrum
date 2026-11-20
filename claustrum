@@ -1736,6 +1736,10 @@ def get_db():
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA journal_mode=WAL")
     _init_schema(db)
+    cutoff = time.time() - DUPLICATE_WORK_SECONDS
+    if db.execute("SELECT 1 FROM work_starts WHERE first_at < ? LIMIT 1", (cutoff,)).fetchone():
+        db.execute("DELETE FROM work_starts WHERE first_at < ?", (cutoff,))
+        db.commit()
     return db
 
 
@@ -4277,8 +4281,8 @@ def _build_classify_block(uid, transcript_path=None):
 # ---------------------------------------------------------------------------
 # Hook handlers  (read JSON from stdin, interact with DB, write to stdout)
 #
-# IMPORTANT: hooks must never crash. A broken hook blocks the user's prompt.
-# Every handler is wrapped in try/except at the dispatch level.
+# Hook errors are caught at dispatch. Public prompt errors block while the
+# duplicate-work check is enabled, because the opening cannot be verified.
 # ---------------------------------------------------------------------------
 
 _OPENING_PLAN_RE = re.compile(r"(/[\w./-]+\.md)\b", re.IGNORECASE)
@@ -4347,7 +4351,6 @@ def _record_work_start(db, uid, raw_prompt, now):
     ).fetchone()
     if not eligibility or not eligibility[0]:
         return None, None
-    db.execute("DELETE FROM work_starts WHERE first_at < ?", (now - DUPLICATE_WORK_SECONDS,))
     previous = db.execute(
         "SELECT w.uid, COALESCE(s.label, w.label) AS label, w.first_at, "
         "w.plan_path, w.branch FROM work_starts w "
@@ -7146,9 +7149,14 @@ def main():
             try:
                 handler(args)
             except Exception as e:
-                # Hooks must never crash — fail silently rather than
-                # block the user's prompt or tool call
                 print(f"[claustrum error: {e}]", file=sys.stderr)
+                if (args.event == "prompt" and not _privacy_mode()
+                        and os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower()
+                        not in ("0", "false", "off")):
+                    print("Claustrum duplicate-work check failed. Resend the prompt after "
+                          "the error is resolved, or set CLAUSTRUM_DUPLICATE_WORK=0 "
+                          "to work without this protection.", file=sys.stderr)
+                    sys.exit(2)
         else:
             hook_p.print_help()
 
