@@ -187,6 +187,61 @@ _banner_printed = False
 _IS_HOOK_INVOCATION = (len(sys.argv) >= 2 and sys.argv[1] in ("hook", "cloud-sync"))
 
 # ---------------------------------------------------------------------------
+# Clean-room sessions (Conductor; see workspace-automation
+# docs/adr/conductor-clean-room-sessions.md)
+#
+# A clean-room session reasons without other sessions' context until a human
+# reconnects it. Claustrum keeps registering it, recording its task and
+# enforcing file claims, but injects nothing about other sessions: no roster,
+# messages, cross-machine tiers, solved work, inbox or duplicate-work matches.
+#
+# The registry the wa launcher and Conductor append to is the source of truth:
+#   $XDG_STATE_HOME/wa/clean-sessions.tsv  (default ~/.local/state)
+#   ts <TAB> tmux session id <TAB> created <TAB> agent <TAB> conversation id
+#      <TAB> name <TAB> event
+# event is `clean` or `reconnected`; the last row for a conversation id wins.
+# CLAUSTRUM_NO_INJECT=1 or WA_CLEAN_SESSION=1 only seed the state: they count
+# when the registry has no row for the session, so a reconnected row lifts
+# them even though a running process can't clear its own environment.
+# ---------------------------------------------------------------------------
+
+CLEAN_EVENTS = ("clean", "reconnected")
+
+
+def _clean_registry_path():
+    root = os.environ.get("XDG_STATE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "state")
+    return os.path.join(root, "wa", "clean-sessions.tsv")
+
+
+def _clean_registry_event(uid):
+    """Last registry event for this conversation id, or None when it has no row.
+    An unrecognised event reads as `clean`, so a malformed row fails closed."""
+    if not uid or uid == "unknown":
+        return None
+    try:
+        with open(_clean_registry_path(), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    event = None
+    for line in lines:
+        parts = (line.split("\t") + [""] * 7)[:7]
+        if parts[4].strip() != uid:
+            continue
+        value = parts[6].strip()
+        event = value if value in CLEAN_EVENTS else "clean"
+    return event
+
+
+def _clean_room(uid):
+    event = _clean_registry_event(uid)
+    if event is not None:
+        return event == "clean"
+    return any(os.environ.get(k, "").strip() == "1"
+               for k in ("CLAUSTRUM_NO_INJECT", "WA_CLEAN_SESSION"))
+
+# ---------------------------------------------------------------------------
 # Cloud client — optional cross-machine coordination layer
 #
 # Activated when CLAUSTRUM_CLOUD_URL is set. All cloud calls are best-effort:
@@ -1607,6 +1662,10 @@ def _overlap_gate(data):
     if not _overlap_gate_enabled():
         return
     uid = data.get("session_id", "unknown")
+    # A clean room neither sees overlapping work nor publishes its plan as an
+    # intent; local file claims still stop it editing a file another session holds.
+    if _clean_room(uid):
+        return
     tool_name = data.get("tool_name", "")
     tool_input = data.get("tool_input") or {}
     cwd = data.get("cwd") or os.getcwd()
@@ -4009,6 +4068,12 @@ def _do_cloud_sync(uid, cwd):
     except Exception:
         pass
 
+    # A clean room stays registered but pulls nothing about other work, and
+    # leaves its inbox undrained so the messages arrive after reconnect.
+    if _clean_room(uid):
+        _close_intents_on_merge(uid, cwd)
+        return
+
     # 2) Cross-machine roster + solved archive + inbox drain.
     list_resp = _cloud_list_peers(uid) or {}
     inbox_msgs = _cloud_inbox_drain(uid) or []
@@ -4420,6 +4485,32 @@ def _duplicate_work_message(previous, now):
     )
 
 
+def _emit_prompt_context(data, output):
+    if data.get("hook_event_name") == "BeforeAgent":
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "BeforeAgent",
+                "additionalContext": output
+            }
+        }) if output else "{}")
+    elif output:
+        print(output)
+
+
+def _emit_clean_collisions(data, others, collisions):
+    """A clean room still hears about files it shares with live sessions — that
+    is coordination, not context — but not what those sessions are working on."""
+    names = {o["uid"]: (_clean_label(o["label"]) if o["label"] else o["uid"][:12])
+             for o in others}
+    lines = []
+    for other_uid, files in collisions.items():
+        listed = ", ".join(sorted(os.path.basename(f) for f in files))
+        lines.append(f"      • {names.get(other_uid, other_uid[:12])}: {listed}")
+    output = ("[Claustrum — clean room]\n  ⚠️  Collisions on files you've claimed:\n"
+              + "\n".join(lines)) if lines else ""
+    _emit_prompt_context(data, output)
+
+
 def hook_prompt(_args):
     """UserPromptSubmit — heartbeat, read messages, inject context."""
     work_start_deadline = time.monotonic() + WORK_START_HOOK_BUDGET
@@ -4432,13 +4523,16 @@ def hook_prompt(_args):
 
     db = get_db()
     now = time.time()
+    # Clean-room sessions are meant to duplicate other work independently, so
+    # they skip the duplicate-work check (its matches would show them that work).
+    clean = _clean_room(uid)
 
     _ensure_session(db, uid, cwd)
     # Reap dead same-host sessions (and release their stale claims) using
     # tmux/boot ground truth, so the roster below reflects who's actually alive.
     _reap_dead(db, now)
 
-    if os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
+    if not clean and os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
         previous, record = _record_work_start(db, uid, raw_prompt, now)
         if previous:
             warning = _duplicate_work_message(dict(previous), now)
@@ -4524,8 +4618,9 @@ def hook_prompt(_args):
     cache = _read_cloud_cache(uid)
     cloud_fresh = bool(cache) and (now - (cache.get("synced_at") or 0)) < CLOUD_CACHE_FRESH
 
-    # Unread messages for this session (or broadcasts), excluding own
-    messages = db.execute(
+    # Unread messages for this session (or broadcasts), excluding own. A clean
+    # room leaves them unread, so they surface after reconnect.
+    messages = [] if clean else db.execute(
         """
         SELECT from_uid, type, body, created_at FROM messages
         WHERE (to_uid = ? OR to_uid IS NULL)
@@ -4612,7 +4707,7 @@ def hook_prompt(_args):
     # Read all classification counters once. A recent successful sync is
     # required — a classification needs somewhere to land — so offline/private
     # sessions stay quiet and rely on the tick floor once back online.
-    if cloud_fresh:
+    if cloud_fresh and not clean:
         counters = db.execute(
             "SELECT classify_prompted, turn_count, turns_since_classify, drift_prompted, "
             "private, classify_attempts, classify_failed, classify_spawned_at, classify_locked "
@@ -4661,7 +4756,7 @@ def hook_prompt(_args):
     # exactly once — tracked by its `synced_at` vs inbox_shown_at — instead of
     # re-showing it every turn until the next sync overwrites the cache.
     inbox_msgs = []
-    if cloud_fresh:
+    if cloud_fresh and not clean:
         csa = cache.get("synced_at") or 0
         shown_at = (trow["inbox_shown_at"] if trow and trow["inbox_shown_at"] else 0)
         if csa > shown_at:
@@ -4684,6 +4779,10 @@ def hook_prompt(_args):
     # run inline here (~4 serial round-trips racing the 5s ceiling). It writes
     # the cloud cache this hook read from above.
     _spawn_cloud_sync(uid, cwd)
+
+    if clean:
+        _emit_clean_collisions(data, others, collisions)
+        return
 
     # Cross-machine layer — rendered from the last sync's cached result (fresh
     # only; a stale/never-synced cache means the cloud is unknown, show nothing).
@@ -4878,7 +4977,8 @@ def hook_pre_tool(_args):
 
     if conflict:
         db.close()
-        task_info = f" (task: {conflict['task']})" if conflict["task"] else ""
+        task_info = (f" (task: {conflict['task']})"
+                     if conflict["task"] and not _clean_room(uid) else "")
         print(
             f"Claustrum: {filepath} is claimed by session "
             f"{conflict['uid'][:12]}{task_info}. "
@@ -5036,9 +5136,12 @@ def hook_start(_args):
     # was away (peers active, PRs finished, claims expired). Gated on a
     # successful checkin so a down cloud doesn't add a second timeout.
     notes = []
-    if others["cnt"] > 0:
+    clean = _clean_room(uid)
+    if clean:
+        notes.append("Clean room: other sessions' context is hidden until reconnect.")
+    elif others["cnt"] > 0:
         notes.append(f"{others['cnt']} other active session(s).")
-    if checkin_resp is not None:
+    if checkin_resp is not None and not clean:
         resume_note = _format_resume(_cloud_resume_check(uid))
         if resume_note:
             notes.append(resume_note)

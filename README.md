@@ -81,6 +81,26 @@ when `CLAUSTRUM_DUPLICATE_WORK=0` explicitly disables the protection. Routine
 turns do not contact this endpoint. Sessions started before this check was
 installed have no opening-brief record.
 
+### Clean-room sessions
+
+A Conductor clean-room session works without other sessions' context until a
+human reconnects it, so its answer isn't shaped by what other sessions already
+concluded. Claustrum still registers it, records its task and enforces file
+claims, but shows it nothing about other work: no roster, messages,
+cross-machine tiers, solved work, intents, inbox or overlap gate. It skips the
+duplicate-opening check (independent duplication is the point) and doesn't
+publish its plans as intents. A file collision still names the file and the
+other session, without that session's task. Messages stay unread and the
+cross-machine inbox stays undrained, so both arrive after reconnect.
+
+The wa registry `$XDG_STATE_HOME/wa/clean-sessions.tsv` (default
+`~/.local/state`) decides, read on every hook. Each row is `ts`, tmux session
+id, created, agent, conversation id, name, event (`clean` or `reconnected`),
+tab-separated; the last row for a conversation wins and an unknown event counts
+as `clean`. `CLAUSTRUM_NO_INJECT=1` or `WA_CLEAN_SESSION=1` count only when the
+registry has no row for the session, so reconnect takes effect without a
+restart. Design: workspace-automation `docs/adr/conductor-clean-room-sessions.md`.
+
 ## Quick Start
 
 ```bash
