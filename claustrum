@@ -229,7 +229,7 @@ def _clean_registry_event(uid):
         parts = (line.split("\t") + [""] * 7)[:7]
         if parts[4].strip() != uid:
             continue
-        value = parts[6].strip()
+        value = parts[6].strip().lower()
         event = value if value in CLEAN_EVENTS else "clean"
     return event
 
@@ -4068,24 +4068,24 @@ def _do_cloud_sync(uid, cwd):
     except Exception:
         pass
 
-    # A clean room stays registered but pulls nothing about other work, and
-    # leaves its inbox undrained so the messages arrive after reconnect.
+    # 2) Cross-machine roster + solved archive + inbox drain. A clean room stays
+    #    registered but pulls nothing about other work and leaves its inbox
+    #    undrained for after reconnect; an empty cache also retires any
+    #    snapshot from before it went clean.
     if _clean_room(uid):
-        _close_intents_on_merge(uid, cwd)
-        return
+        _write_cloud_cache(uid, {})
+    else:
+        list_resp = _cloud_list_peers(uid) or {}
+        inbox_msgs = _cloud_inbox_drain(uid) or []
+        _persist_inbox(uid, inbox_msgs)
 
-    # 2) Cross-machine roster + solved archive + inbox drain.
-    list_resp = _cloud_list_peers(uid) or {}
-    inbox_msgs = _cloud_inbox_drain(uid) or []
-    _persist_inbox(uid, inbox_msgs)
-
-    _write_cloud_cache(uid, {
-        "synced_at": now,
-        "tiers": list_resp.get("tiers"),
-        "solved": list_resp.get("solved"),
-        "intents": list_resp.get("intents"),
-        "inbox": inbox_msgs,
-    })
+        _write_cloud_cache(uid, {
+            "synced_at": now,
+            "tiers": list_resp.get("tiers"),
+            "solved": list_resp.get("solved"),
+            "intents": list_resp.get("intents"),
+            "inbox": inbox_msgs,
+        })
 
     # 3) A merged PR closes this session's planned work.
     _close_intents_on_merge(uid, cwd)
@@ -4497,15 +4497,14 @@ def _emit_prompt_context(data, output):
         print(output)
 
 
-def _emit_clean_collisions(data, others, collisions):
+def _emit_clean_collisions(data, collisions):
     """A clean room still hears about files it shares with live sessions — that
-    is coordination, not context — but not what those sessions are working on."""
-    names = {o["uid"]: (_clean_label(o["label"]) if o["label"] else o["uid"][:12])
-             for o in others}
+    is coordination, not context — but not what those sessions are working on.
+    Sessions are named by uid: labels are often derived from the task."""
     lines = []
     for other_uid, files in collisions.items():
         listed = ", ".join(sorted(os.path.basename(f) for f in files))
-        lines.append(f"      • {names.get(other_uid, other_uid[:12])}: {listed}")
+        lines.append(f"      • {other_uid[:12]}: {listed}")
     output = ("[Claustrum — clean room]\n  ⚠️  Collisions on files you've claimed:\n"
               + "\n".join(lines)) if lines else ""
     _emit_prompt_context(data, output)
@@ -4532,7 +4531,10 @@ def hook_prompt(_args):
     # tmux/boot ground truth, so the roster below reflects who's actually alive.
     _reap_dead(db, now)
 
-    if not clean and os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
+    if clean:
+        # Its opening has passed: a long prompt after reconnect is mid-task work.
+        db.execute("UPDATE sessions SET work_start_eligible = 0 WHERE uid = ?", (uid,))
+    elif os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
         previous, record = _record_work_start(db, uid, raw_prompt, now)
         if previous:
             warning = _duplicate_work_message(dict(previous), now)
@@ -4781,7 +4783,7 @@ def hook_prompt(_args):
     _spawn_cloud_sync(uid, cwd)
 
     if clean:
-        _emit_clean_collisions(data, others, collisions)
+        _emit_clean_collisions(data, collisions)
         return
 
     # Cross-machine layer — rendered from the last sync's cached result (fresh
@@ -4796,8 +4798,7 @@ def hook_prompt(_args):
     # Only output if there's something worth reporting (local OR cloud).
     if (not messages and not others and not cloud_lines and not solved_lines
             and not classify_lines and not inbox_msgs):
-        if data.get("hook_event_name") == "BeforeAgent":
-            print("{}")
+        _emit_prompt_context(data, "")
         return
 
     parts = []
@@ -4918,16 +4919,7 @@ def hook_prompt(_args):
         parts.extend(classify_lines)
 
     output = "\n".join(parts)
-    if output.strip():
-        if data.get("hook_event_name") == "BeforeAgent":
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "BeforeAgent",
-                    "additionalContext": output
-                }
-            }))
-        else:
-            print(output)
+    _emit_prompt_context(data, output if output.strip() else "")
 
 
 def hook_pre_tool(_args):
@@ -6242,7 +6234,10 @@ def _deliver(db, from_uid, to_uid, mtype, body):
         "VALUES (?, ?, ?, ?, ?)",
         (from_uid, to, mtype, body, time.time()),
     )
-    if to and os.environ.get("CLAUSTRUM_SOCKET_PUSH"):
+    # A clean room reads the row only after reconnect, so it is never pushed.
+    # Registry only: this process's env says nothing about the recipient.
+    if (to and os.environ.get("CLAUSTRUM_SOCKET_PUSH")
+            and _clean_registry_event(to) != "clean"):
         row = db.execute(
             "SELECT msg_socket FROM sessions WHERE uid = ? AND status = 'active'",
             (to,),

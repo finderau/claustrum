@@ -197,9 +197,66 @@ def test_clean_collision_names_files_not_tasks(cli, monkeypatch):
     db.commit()
     db.close()
     out = _run_prompt(m, monkeypatch, CLEAN_UID)
-    assert "Collisions" in out and "a.py" in out and "peer-session" in out
+    assert "Collisions" in out and "a.py" in out and "peer-uid-1" in out
+    # Labels are often derived from the task, so they're withheld too.
+    assert "peer-session" not in out
     assert "peer secret plan" not in out
     assert "peer message body" not in out
+
+
+def test_event_match_ignores_case(cli):
+    m, _ = cli
+    _register(m, CLEAN_UID, "clean")
+    _register(m, CLEAN_UID, "Reconnected")
+    assert m._clean_room(CLEAN_UID) is False
+
+
+def test_reconnected_long_prompt_is_not_an_opening(cli, monkeypatch):
+    m, _ = cli
+    _register(m, CLEAN_UID, "clean")
+    _run_prompt(m, monkeypatch, CLEAN_UID)
+    _register(m, CLEAN_UID, "reconnected")
+    monkeypatch.setenv("CLAUSTRUM_DUPLICATE_WORK", "1")
+    monkeypatch.setattr(m, "_should_cloud_send", lambda *a, **k: False)
+    recorded = []
+    real = m._record_work_start
+
+    def _spy(db, uid, raw, now):
+        result = real(db, uid, raw, now)
+        recorded.append(result[1])
+        return result
+
+    monkeypatch.setattr(m, "_record_work_start", _spy)
+    _run_prompt(m, monkeypatch, CLEAN_UID, prompt="reconcile " * 40)
+    assert recorded == [None]
+
+
+def test_clean_sync_retires_pre_clean_cache(cli):
+    m, _ = cli
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+    assert m._read_cloud_cache(CLEAN_UID).get("tiers")
+    _register(m, CLEAN_UID, "clean")
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+    assert not m._read_cloud_cache(CLEAN_UID).get("synced_at")
+
+
+def test_directed_message_not_pushed_to_clean_room(cli, monkeypatch):
+    m, _ = cli
+    _register(m, CLEAN_UID, "clean")
+    monkeypatch.setenv("CLAUSTRUM_SOCKET_PUSH", "1")
+    pushed = []
+    monkeypatch.setattr(m, "_socket_push", lambda *a: pushed.append(a))
+    db = m.get_db()
+    for uid in (CLEAN_UID, "peer-uid-2"):
+        m._ensure_session(db, uid, "/tmp/x")
+        db.execute("UPDATE sessions SET status = 'active', msg_socket = '/tmp/s' "
+                   "WHERE uid = ?", (uid,))
+    m._deliver(db, "peer-uid-2", CLEAN_UID, "info", "I already concluded X")
+    assert pushed == []
+    m._deliver(db, CLEAN_UID, "peer-uid-2", "info", "hello")
+    assert len(pushed) == 1
+    db.commit()
+    db.close()
 
 
 def test_clean_skips_duplicate_work_check(cli, monkeypatch):

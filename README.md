@@ -90,8 +90,9 @@ claims, but shows it nothing about other work: no roster, messages,
 cross-machine tiers, solved work, intents, inbox or overlap gate. It skips the
 duplicate-opening check (independent duplication is the point) and doesn't
 publish its plans as intents. A file collision still names the file and the
-other session, without that session's task. Messages stay unread and the
-cross-machine inbox stays undrained, so both arrive after reconnect.
+other session's id, but not its name or task (names are often derived from the
+task). Messages stay unread, aren't socket-pushed, and the cross-machine inbox
+stays undrained, so all of them arrive after reconnect.
 
 The wa registry `$XDG_STATE_HOME/wa/clean-sessions.tsv` (default
 `~/.local/state`) decides, read on every hook. Each row is `ts`, tmux session
