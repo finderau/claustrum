@@ -924,10 +924,22 @@ def _write_cloud_cache(uid, data):
         pass
 
 
-def _unshown_cached_inbox(uid, shown_at):
+def _unshown_cached_inbox(uid):
     """Inbox messages in the cache that the prompt hook has not displayed: a
     sync it never showed (clean or stale at the time), or a clean room's
     carried-over messages, which have no synced_at."""
+    shown_at = 0
+    try:
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT inbox_shown_at FROM sessions WHERE uid = ?", (uid,)
+            ).fetchone()
+            shown_at = (row["inbox_shown_at"] if row else 0) or 0
+        finally:
+            db.close()
+    except Exception:
+        pass
     cache = _read_cloud_cache(uid)
     synced_at = cache.get("synced_at")
     if synced_at and synced_at <= shown_at:
@@ -4057,16 +4069,14 @@ def _do_cloud_sync(uid, cwd):
     # prompt must not land on a process's visible command line. task/label were
     # stamped into SQLite by the prompt hook before it spawned us.
     task = label = None
-    shown_at = 0
     try:
         db = get_db()
         try:
             row = db.execute(
-                "SELECT task, label, inbox_shown_at FROM sessions WHERE uid = ?", (uid,)
+                "SELECT task, label FROM sessions WHERE uid = ?", (uid,)
             ).fetchone()
             if row:
                 task, label = row["task"], row["label"]
-                shown_at = row["inbox_shown_at"] or 0
         finally:
             db.close()
     except Exception:
@@ -4096,15 +4106,18 @@ def _do_cloud_sync(uid, cwd):
     #    registered but pulls nothing about other work and leaves its inbox
     #    undrained for after reconnect. Its cache keeps only messages already
     #    drained but not yet shown (no synced_at, so nothing renders), which
-    #    retires any pre-clean snapshot without losing them.
-    pending = _unshown_cached_inbox(uid, shown_at)
+    #    retires any pre-clean snapshot without losing them. Pending is read
+    #    after the network calls so a prompt that showed the old cache while
+    #    they ran has already stamped inbox_shown_at.
     if _clean_room(uid):
+        pending = _unshown_cached_inbox(uid)
         _write_cloud_cache(uid, {"inbox": pending} if pending else {})
     else:
         list_resp = _cloud_list_peers(uid) or {}
         drained = _cloud_inbox_drain(uid) or []
         _persist_inbox(uid, drained)
-        seen = {m.get("id") for m in pending if isinstance(m, dict)}
+        pending = _unshown_cached_inbox(uid)
+        seen = {m.get("id") for m in pending}
         inbox_msgs = pending + [m for m in drained if m.get("id") not in seen]
 
         _write_cloud_cache(uid, {

@@ -299,6 +299,19 @@ def test_drained_inbox_survives_going_clean(cli, monkeypatch):
     assert "cross-machine idea" not in _run_prompt(m, monkeypatch, CLEAN_UID)
 
 
+def test_inbox_shown_during_sync_is_not_carried(cli, monkeypatch):
+    m, _ = cli
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+
+    def _drain_while_prompt_shows(u):
+        assert "cross-machine idea" in _run_prompt(m, monkeypatch, CLEAN_UID)
+        return []
+
+    monkeypatch.setattr(m, "_cloud_inbox_drain", _drain_while_prompt_shows)
+    m.cmd_cloud_sync(types.SimpleNamespace(uid=CLEAN_UID, cwd="/tmp/x"))
+    assert m._read_cloud_cache(CLEAN_UID).get("inbox") == []
+
+
 def test_clean_skips_duplicate_work_check(cli, monkeypatch):
     m, _ = cli
     monkeypatch.setenv("CLAUSTRUM_DUPLICATE_WORK", "1")
