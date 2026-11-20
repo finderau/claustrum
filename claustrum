@@ -4432,6 +4432,24 @@ def _duplicate_work_message(previous, now):
     )
 
 
+def _block_duplicate(db, message, update=None):
+    """Exit 2 on a confirmed duplicate even if recording the block fails, so the
+    fail-open handler in main() never lets a real duplicate through."""
+    try:
+        if update:
+            db.execute(*update)
+        db.commit()
+    except Exception as e:
+        print(f"[claustrum error: {e}]", file=sys.stderr)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+    print(message, file=sys.stderr)
+    sys.exit(2)
+
+
 def hook_prompt(_args):
     """UserPromptSubmit — heartbeat, read messages, inject context."""
     check_notes = []
@@ -4454,11 +4472,7 @@ def hook_prompt(_args):
     if os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
         previous, record = _record_work_start(db, uid, raw_prompt, now)
         if previous:
-            warning = _duplicate_work_message(dict(previous), now)
-            db.commit()
-            db.close()
-            print(warning, file=sys.stderr)
-            sys.exit(2)
+            _block_duplicate(db, _duplicate_work_message(dict(previous), now))
         if record and _should_cloud_send():
             db.commit()
             cloud_result = _cloud_work_start(record, work_start_deadline)
@@ -4473,13 +4487,9 @@ def hook_prompt(_args):
                 cloud_result = {"match": None}
             match = cloud_result.get("match")
             if match and not record["acknowledge"]:
-                db.execute("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
-                           "WHERE opening_id = ?",
-                           (record["opening_id"],))
-                db.commit()
-                db.close()
-                print(_duplicate_work_message(match, now), file=sys.stderr)
-                sys.exit(2)
+                _block_duplicate(db, _duplicate_work_message(match, now),
+                                 ("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
+                                  "WHERE opening_id = ?", (record["opening_id"],)))
             elif not check_notes:
                 db.execute("UPDATE work_starts SET cloud_checked = 1 WHERE opening_id = ?",
                            (record["opening_id"],))
