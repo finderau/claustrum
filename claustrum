@@ -22,7 +22,9 @@ Hook integration:
 
 import argparse
 import datetime as _dt
+import functools
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -34,6 +36,7 @@ import sys
 import threading
 import time
 import uuid
+import zlib
 from pathlib import Path
 from urllib import request as _urlrequest
 from urllib import parse as _urlparse
@@ -1735,7 +1738,8 @@ def get_db():
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout=5000")
     db.execute("PRAGMA journal_mode=WAL")
-    _init_schema(db)
+    if db.execute("PRAGMA user_version").fetchone()[0] != _schema_version():
+        _init_schema(db)
     cutoff = time.time() - DUPLICATE_WORK_SECONDS
     if db.execute("SELECT 1 FROM work_starts WHERE first_at < ? LIMIT 1", (cutoff,)).fetchone():
         db.execute("DELETE FROM work_starts WHERE first_at < ?", (cutoff,))
@@ -1978,7 +1982,15 @@ def _init_schema(db):
             "WHERE COALESCE(topic_confidence, 0) >= ? AND COALESCE(classify_locked, 0) = 0",
             (CLASSIFY_CONF_FLOOR,),
         )
+    db.execute(f"PRAGMA user_version = {_schema_version()}")
     db.commit()
+
+
+@functools.lru_cache(maxsize=None)
+def _schema_version():
+    # Derived from _init_schema's source so any schema edit re-runs it once, while
+    # every other connection skips its BEGIN IMMEDIATE write lock.
+    return zlib.crc32(inspect.getsource(_init_schema).encode()) & 0x7FFFFFFF
 
 
 # ---------------------------------------------------------------------------
@@ -4420,8 +4432,27 @@ def _duplicate_work_message(previous, now):
     )
 
 
+def _block_duplicate(db, message, update=None):
+    """Exit 2 on a confirmed duplicate even if recording the block fails, so the
+    fail-open handler in main() never lets a real duplicate through."""
+    try:
+        if update:
+            db.execute(*update)
+        db.commit()
+    except Exception as e:
+        print(f"[claustrum error: {e}]", file=sys.stderr)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+    print(message, file=sys.stderr)
+    sys.exit(2)
+
+
 def hook_prompt(_args):
     """UserPromptSubmit — heartbeat, read messages, inject context."""
+    check_notes = []
     work_start_deadline = time.monotonic() + WORK_START_HOOK_BUDGET
     data = json.load(sys.stdin)
     uid = data.get("session_id", "unknown")
@@ -4441,11 +4472,7 @@ def hook_prompt(_args):
     if os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower() not in ("0", "false", "off"):
         previous, record = _record_work_start(db, uid, raw_prompt, now)
         if previous:
-            warning = _duplicate_work_message(dict(previous), now)
-            db.commit()
-            db.close()
-            print(warning, file=sys.stderr)
-            sys.exit(2)
+            _block_duplicate(db, _duplicate_work_message(dict(previous), now))
         if record and _should_cloud_send():
             db.commit()
             cloud_result = _cloud_work_start(record, work_start_deadline)
@@ -4454,26 +4481,18 @@ def hook_prompt(_args):
                     or (cloud_result["match"] is not None
                         and not isinstance(cloud_result["match"], dict))):
                 _spawn_cloud_sync(uid, cwd)
-                db.close()
-                print(
-                    "Claustrum duplicate-work check: the company-wide check is unavailable. "
-                    "This brief is recorded locally, but Cloud has not checked it. "
-                    "Resend the prompt after a moment, or set "
-                    "CLAUSTRUM_DUPLICATE_WORK=0 to work without this protection.",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
+                check_notes.append(
+                    "Claustrum duplicate-work check: the company-wide check is unavailable, "
+                    "so this brief was only checked locally.")
+                cloud_result = {"match": None}
             match = cloud_result.get("match")
             if match and not record["acknowledge"]:
-                db.execute("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
-                           "WHERE opening_id = ?",
+                _block_duplicate(db, _duplicate_work_message(match, now),
+                                 ("UPDATE work_starts SET acknowledged = 0, cloud_checked = 1 "
+                                  "WHERE opening_id = ?", (record["opening_id"],)))
+            elif not check_notes:
+                db.execute("UPDATE work_starts SET cloud_checked = 1 WHERE opening_id = ?",
                            (record["opening_id"],))
-                db.commit()
-                db.close()
-                print(_duplicate_work_message(match, now), file=sys.stderr)
-                sys.exit(2)
-            db.execute("UPDATE work_starts SET cloud_checked = 1 WHERE opening_id = ?",
-                       (record["opening_id"],))
 
     # Auto-set task from user's prompt LOCALLY so same-machine sessions see
     # intent. This stays in SQLite and NEVER leaves the machine.
@@ -4696,7 +4715,7 @@ def hook_prompt(_args):
 
     # Only output if there's something worth reporting (local OR cloud).
     if (not messages and not others and not cloud_lines and not solved_lines
-            and not classify_lines and not inbox_msgs):
+            and not classify_lines and not inbox_msgs and not check_notes):
         if data.get("hook_event_name") == "BeforeAgent":
             print("{}")
         return
@@ -4817,6 +4836,10 @@ def hook_prompt(_args):
     if classify_lines:
         parts.append("")
         parts.extend(classify_lines)
+
+    if check_notes:
+        parts.append("")
+        parts.extend(f"  ⚠️  {n}" for n in check_notes)
 
     output = "\n".join(parts)
     if output.strip():
@@ -7149,14 +7172,9 @@ def main():
             try:
                 handler(args)
             except Exception as e:
+                # Fail open: a broken check must never eat the prompt; only a real
+                # duplicate-work finding blocks.
                 print(f"[claustrum error: {e}]", file=sys.stderr)
-                if (args.event == "prompt" and not _privacy_mode()
-                        and os.environ.get("CLAUSTRUM_DUPLICATE_WORK", "1").strip().lower()
-                        not in ("0", "false", "off")):
-                    print("Claustrum duplicate-work check failed. Resend the prompt after "
-                          "the error is resolved, or set CLAUSTRUM_DUPLICATE_WORK=0 "
-                          "to work without this protection.", file=sys.stderr)
-                    sys.exit(2)
         else:
             hook_p.print_help()
 

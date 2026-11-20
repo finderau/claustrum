@@ -269,14 +269,14 @@ def test_cloud_match_blocks_and_retry_acknowledges(local, monkeypatch):
     assert len(sent) == 2 and sent[1]["acknowledge"] is True
 
 
-def test_unavailable_company_check_blocks_until_verified(local, monkeypatch):
+def test_unavailable_company_check_warns_and_retries_later(local, monkeypatch):
     calls = []
     monkeypatch.setattr(local, "_should_cloud_send", lambda: True)
     monkeypatch.setattr(local, "_spawn_cloud_sync", lambda uid, cwd: calls.append(("warm", uid)))
     monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: calls.append(("check", record)) or None)
 
-    code, _, err = _prompt(local, monkeypatch, "new", BRIEF)
-    assert code == 2 and "company-wide check is unavailable" in err
+    code, out, _ = _prompt(local, monkeypatch, "new", BRIEF)
+    assert code == 0 and "company-wide check is unavailable" in out
     assert calls[0][0] == "check" and calls[1] == ("warm", "new")
     db = local.get_db()
     assert db.execute("SELECT cloud_checked FROM work_starts WHERE uid = 'new'").fetchone()[0] == 0
@@ -295,12 +295,12 @@ def test_private_session_never_calls_cloud(local, monkeypatch):
     assert _prompt(local, monkeypatch, "private", BRIEF)[0] == 0
 
 
-@pytest.mark.parametrize("privacy,disabled,expected", [
-    (False, False, 2),
-    (True, False, 0),
-    (False, True, 0),
+@pytest.mark.parametrize("privacy,disabled", [
+    (False, False),
+    (True, False),
+    (False, True),
 ])
-def test_prompt_hook_db_error_blocks_public_work(local, monkeypatch, privacy, disabled, expected):
+def test_prompt_hook_db_error_fails_open(local, monkeypatch, privacy, disabled):
     def locked_db(_args):
         raise sqlite3.OperationalError("database is locked")
 
@@ -312,11 +312,50 @@ def test_prompt_hook_db_error_blocks_public_work(local, monkeypatch, privacy, di
         monkeypatch.setenv("CLAUSTRUM_DUPLICATE_WORK", "0")
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
-        with pytest.raises(SystemExit) if expected else contextlib.nullcontext() as exit_info:
-            local.main()
-    if expected:
-        assert exit_info.value.code == expected
-        assert "duplicate-work check failed" in err.getvalue()
+        local.main()
+    assert "database is locked" in err.getvalue()
+
+
+class _CommitFails:
+    def __init__(self, db):
+        self._db = db
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def commit(self):
+        raise sqlite3.OperationalError("database is locked")
+
+
+def test_confirmed_local_duplicate_blocks_when_commit_fails(local, monkeypatch):
+    assert _prompt(local, monkeypatch, "first", BRIEF)[0] == 0
+    real_get_db = local.get_db
+    monkeypatch.setattr(local, "get_db", lambda: _CommitFails(real_get_db()))
+    code, _, err = _prompt(local, monkeypatch, "second", BRIEF)
+    assert code == 2
+    assert "database is locked" in err and "review that session's progress" in err
+
+
+def test_confirmed_cloud_duplicate_blocks_when_commit_fails(local, monkeypatch):
+    monkeypatch.setattr(local, "_should_cloud_send", lambda: True)
+    monkeypatch.setattr(local, "_cloud_work_start", lambda record, deadline: {"match": {
+        "uid": "other-machine", "user_email": "colleague@finder.com",
+        "label": "bot-migration", "first_at": "2026-11-18T07:14:52Z",
+    }})
+    real_get_db = local.get_db
+    calls = {"n": 0}
+
+    class _SecondCommitFails(_CommitFails):
+        def commit(self):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise sqlite3.OperationalError("database is locked")
+            self._db.commit()
+
+    monkeypatch.setattr(local, "get_db", lambda: _SecondCommitFails(real_get_db()))
+    code, _, err = _prompt(local, monkeypatch, "new", BRIEF)
+    assert code == 2
+    assert "database is locked" in err and "colleague@finder.com" in err
 
 
 def test_cloud_work_start_respects_prompt_deadline(local, monkeypatch):
