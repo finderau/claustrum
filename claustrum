@@ -3113,20 +3113,20 @@ def _claude_session_id_from_cmd(cmd):
 _PRIVATE_ENV_RE = re.compile(r"(?:^|\s)(?:CLAUSTRUM_PRIVATE=1|WA_PRIVATE_SESSION=1)(?:\s|$)")
 
 
-def _claude_pid_session(pid):
-    """(session_id, private) for a live `claude` process. private is True when
-    the process runs under CLAUSTRUM_PRIVATE / WA_PRIVATE_SESSION, when its
-    session's own row is private, or when its environment can't be read —
-    fail closed, so an adopted placeholder never exposes a private transcript.
+def _claude_pid_privacy(pid):
+    """(session_id, private, known) for a live `claude` process. private is True when
+    the process runs under CLAUSTRUM_PRIVATE / WA_PRIVATE_SESSION or its session's own
+    row is private. known is False when the environment can't be read (no pid, ps
+    failed, or a sandbox hid it); private is then True — fail closed.
     session_id is None for a bare `claude` (no --session-id/--resume)."""
     if not pid:
-        return None, True
+        return None, True, False
     try:
         r = subprocess.run(["ps", "-wwE", "-o", "command=", "-p", str(pid)],
                            capture_output=True, text=True, timeout=2)
         out = r.stdout or ""
         if r.returncode != 0 or "HOME=" not in out:
-            return _claude_session_id_from_cmd(out), True
+            return _claude_session_id_from_cmd(out), True, False
         sid = _claude_session_id_from_cmd(out)
         private = bool(_PRIVATE_ENV_RE.search(out)) and " CLAUSTRUM_PUBLIC=1" not in out
         if sid and not private:
@@ -3136,9 +3136,16 @@ def _claude_pid_session(pid):
             finally:
                 db.close()
             private = bool(row and row["private"])
-        return sid, private
+        return sid, private, True
     except Exception:
-        return None, True
+        return None, True, False
+
+
+def _claude_pid_session(pid):
+    """(session_id, private) for a live `claude` process; private fails closed, so an
+    adopted placeholder never exposes a private transcript."""
+    sid, private, _known = _claude_pid_privacy(pid)
+    return sid, private
 
 
 def _find_claude_transcript_by_pid(pid):
@@ -5507,19 +5514,26 @@ def cmd_heartbeat(args):
         agent_panes = _live_agent_panes()
         if agent_panes:
             have = {
-                p: (u, pid)
-                for (p, u, pid) in db.execute(
-                    "SELECT tmux_pane, uid, pid FROM sessions "
+                p: (u, pid, priv)
+                for (p, u, pid, priv) in db.execute(
+                    "SELECT tmux_pane, uid, pid, private FROM sessions "
                     "WHERE status = 'active' AND tmux_pane IS NOT NULL"
                 ).fetchall()
             }
             for pane, item in agent_panes.items():
                 cpid = item[0]
                 if pane in have:
-                    curr_uid, curr_pid = have[pane]
+                    curr_uid, curr_pid, curr_private = have[pane]
+                    own_placeholder = curr_uid == f"tmux-{host}-{pane}-{cpid}"
+                    # A placeholder pinned private by an unreadable environment is released
+                    # once a read shows the process isn't private.
+                    if own_placeholder and curr_private and item[1] == "claude":
+                        _sid, claude_private, privacy_known = _claude_pid_privacy(cpid)
+                        if privacy_known and not claude_private:
+                            db.execute("UPDATE sessions SET private = 0 WHERE uid = ?", (curr_uid,))
                     # If the pane is already tracked by a real session (non-placeholder)
                     # or by this process's exact placeholder, skip adoption.
-                    if not curr_uid.startswith("tmux-") or curr_uid == f"tmux-{host}-{pane}-{cpid}":
+                    if not curr_uid.startswith("tmux-") or own_placeholder:
                         continue
                 kind = item[1]
                 pane_cwd = item[2] if len(item) > 2 else None
@@ -5536,7 +5550,11 @@ def cmd_heartbeat(args):
                     tpath = _find_codex_by_pid(cpid)
                 elif kind == "claude":
                     tpath = _find_claude_transcript_by_pid(cpid)
-                pane_private = 1 if kind == "claude" and _claude_pid_session(cpid)[1] else 0
+                if kind == "claude":
+                    _sid, claude_private, privacy_known = _claude_pid_privacy(cpid)
+                    pane_private = 1 if claude_private else 0
+                else:
+                    pane_private, privacy_known = 0, True
                 # Record the pane's agent kind on the placeholder. A 'claude'
                 # placeholder is usually a churn stand-in during a relaunch gap
                 # (the real hook session re-registers and classifies itself), so
@@ -5552,8 +5570,13 @@ def cmd_heartbeat(args):
                     "agent=COALESCE(excluded.agent, sessions.agent), "
                     "cwd=COALESCE(excluded.cwd, sessions.cwd), "
                     "transcript_path=COALESCE(excluded.transcript_path, sessions.transcript_path), "
-                    "private=MAX(COALESCE(sessions.private, 0), excluded.private)",
-                    (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath, pane_private),
+                    # A read of the process environment decides privacy; an unreadable one
+                    # (e.g. a sandboxed tick) keeps the row's value. Otherwise one failed read
+                    # pins a live session private and hides it from the board for good.
+                    "private=CASE WHEN ? THEN excluded.private "
+                    "ELSE COALESCE(sessions.private, excluded.private) END",
+                    (uid, label, now, now, now, host, pane, cpid, boot, kind, pane_cwd, tpath, pane_private,
+                     1 if privacy_known else 0),
                 )
                 _retire_pane_predecessors(db, uid, host, boot, pane)
                 row_private = db.execute(
