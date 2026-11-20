@@ -1381,7 +1381,7 @@ def test_find_transcript_claude_placeholder_resolves_by_pid(tmp_path, monkeypatc
 
 # --- placeholder privacy follows the process, not one failed read -------------
 
-def _adoption_tick(monkeypatch, tmp_path, row_status, row_private, privacy):
+def _adoption_tick(monkeypatch, tmp_path, row_status, row_private, privacy, published=None, footer=None):
     monkeypatch.setattr(cli, "DB_DIR", tmp_path)
     monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr(cli, "_host", lambda: "host1")
@@ -1393,10 +1393,14 @@ def _adoption_tick(monkeypatch, tmp_path, row_status, row_private, privacy):
     monkeypatch.setattr(cli, "_pid_alive", lambda pid, boot_id, boot: pid == 10)
     monkeypatch.setattr(cli, "_reap_dead", lambda db, now: [])
     monkeypatch.setattr(cli, "_find_claude_transcript_by_pid", lambda pid: None)
-    monkeypatch.setattr(cli, "_claude_pid_privacy", lambda pid: privacy)
+    monkeypatch.setattr(cli, "_claude_pid_privacy", lambda pid, db=None: privacy)
     for name in dir(cli):
         if name.startswith("_cloud_"):
             monkeypatch.setattr(cli, name, lambda *a, **k: None)
+    if published is not None:
+        monkeypatch.setattr(cli, "_cloud_checkin", lambda uid, **k: published.append(uid))
+    monkeypatch.setattr(cli, "_write_footer_state",
+                        lambda feed, state: footer.extend(feed) if footer is not None else None)
     now = cli.time.time()
     db = cli.get_db()
     db.execute(
@@ -1431,6 +1435,35 @@ def test_unreadable_process_does_not_make_a_public_placeholder_private(monkeypat
 @pytest.mark.parametrize("status", ["active", "paused"])
 def test_private_process_keeps_the_placeholder_private(monkeypatch, tmp_path, status):
     assert _adoption_tick(monkeypatch, tmp_path, status, 1, ("sid", True, True)) == 1
+
+
+def test_released_placeholder_is_published_and_unlocked_in_the_same_tick(monkeypatch, tmp_path):
+    published, footer = [], []
+    _adoption_tick(monkeypatch, tmp_path, "active", 1, ("sid", False, True), published, footer)
+    assert published == ["tmux-host1-%33-10"]
+    assert footer == [("%33", 0)]
+
+
+def test_still_private_placeholder_is_not_published(monkeypatch, tmp_path):
+    published, footer = [], []
+    _adoption_tick(monkeypatch, tmp_path, "active", 1, (None, True, False), published, footer)
+    assert published == []
+    assert footer == [("%33", 1)]
+
+
+def test_claude_pid_privacy_reads_the_session_row_on_the_callers_connection(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    env = "claude --resume abc HOME=/Users/x"
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **k: cli.subprocess.CompletedProcess(a, 0, stdout=env, stderr=""))
+    monkeypatch.setattr(cli, "_claude_session_id_from_cmd", lambda out: "abc")
+    db = cli.get_db()
+    db.execute("INSERT INTO sessions (uid, label, status, last_seen, started_at, private) "
+               "VALUES ('abc', 'x', 'active', 0, 0, 1)")
+    monkeypatch.setattr(cli, "get_db", lambda: pytest.fail("opened a second connection"))
+    assert cli._claude_pid_privacy(10, db) == ("abc", True, True)
+    db.close()
 
 
 def test_claude_pid_privacy_fails_closed_without_an_environment(monkeypatch):

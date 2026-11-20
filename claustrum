@@ -3113,12 +3113,14 @@ def _claude_session_id_from_cmd(cmd):
 _PRIVATE_ENV_RE = re.compile(r"(?:^|\s)(?:CLAUSTRUM_PRIVATE=1|WA_PRIVATE_SESSION=1)(?:\s|$)")
 
 
-def _claude_pid_privacy(pid):
+def _claude_pid_privacy(pid, db=None):
     """(session_id, private, known) for a live `claude` process. private is True when
     the process runs under CLAUSTRUM_PRIVATE / WA_PRIVATE_SESSION or its session's own
     row is private. known is False when the environment can't be read (no pid, ps
     failed, or a sandbox hid it); private is then True — fail closed.
-    session_id is None for a bare `claude` (no --session-id/--resume)."""
+    session_id is None for a bare `claude` (no --session-id/--resume).
+    Pass the caller's open db mid-transaction: a second connection would wait on its
+    write lock and time out into fail-closed."""
     if not pid:
         return None, True, False
     try:
@@ -3130,12 +3132,13 @@ def _claude_pid_privacy(pid):
         sid = _claude_session_id_from_cmd(out)
         private = bool(_PRIVATE_ENV_RE.search(out)) and " CLAUSTRUM_PUBLIC=1" not in out
         if sid and not private:
-            db = get_db()
+            conn = db or get_db()
             try:
-                row = db.execute("SELECT private FROM sessions WHERE uid = ?", (sid,)).fetchone()
+                row = conn.execute("SELECT private FROM sessions WHERE uid = ?", (sid,)).fetchone()
             finally:
-                db.close()
-            private = bool(row and row["private"])
+                if conn is not db:
+                    conn.close()
+            private = bool(row and row[0])
         return sid, private, True
     except Exception:
         return None, True, False
@@ -5528,9 +5531,15 @@ def cmd_heartbeat(args):
                     # A placeholder pinned private by an unreadable environment is released
                     # once a read shows the process isn't private.
                     if own_placeholder and curr_private and item[1] == "claude":
-                        _sid, claude_private, privacy_known = _claude_pid_privacy(cpid)
+                        _sid, claude_private, privacy_known = _claude_pid_privacy(cpid, db)
                         if privacy_known and not claude_private:
                             db.execute("UPDATE sessions SET private = 0 WHERE uid = ?", (curr_uid,))
+                            # refreshed and live_footer are built in lockstep, so one index
+                            # clears both: the cloud loop publishes it and the footer drops the lock.
+                            for i, r in enumerate(refreshed):
+                                if r[0] == curr_uid:
+                                    refreshed[i] = r[:4] + (0,) + r[5:]
+                                    live_footer[i] = (live_footer[i][0], 0)
                     # If the pane is already tracked by a real session (non-placeholder)
                     # or by this process's exact placeholder, skip adoption.
                     if not curr_uid.startswith("tmux-") or own_placeholder:
@@ -5551,7 +5560,7 @@ def cmd_heartbeat(args):
                 elif kind == "claude":
                     tpath = _find_claude_transcript_by_pid(cpid)
                 if kind == "claude":
-                    _sid, claude_private, privacy_known = _claude_pid_privacy(cpid)
+                    _sid, claude_private, privacy_known = _claude_pid_privacy(cpid, db)
                     pane_private = 1 if claude_private else 0
                 else:
                     pane_private, privacy_known = 0, True
