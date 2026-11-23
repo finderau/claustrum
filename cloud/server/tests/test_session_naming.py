@@ -255,3 +255,50 @@ def test_refine_keeps_auto_label_when_live_name_unreadable(env, monkeypatch):
     monkeypatch.setattr(cli.subprocess, "run", fail)
     assert cli._refine_auto_name("u1") is None
     assert _row()["auto_label"] == "yo-still-think-have"
+
+
+def _pane_row(db, uid, pid, status="active"):
+    db.execute(
+        "INSERT INTO sessions (uid, label, tmux_pane, host, boot_id, status, last_seen, "
+        "started_at, domain, pid) VALUES (?, 'work', '%7', 'h', 'b', ?, 0, 0, 'conductor', ?)",
+        (uid, status, pid))
+
+
+def _status(db, uid):
+    return db.execute("SELECT status FROM sessions WHERE uid = ?", (uid,)).fetchone()[0]
+
+
+def _exited_pid():
+    import subprocess
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
+def test_headless_agent_in_pane_does_not_retire_running_session(env):
+    import os
+    db = cli.get_db()
+    _pane_row(db, "real", os.getpid())
+    _pane_row(db, "headless", os.getpid() + 1)
+    cli._retire_pane_predecessors(db, "headless", "h", "b", "%7")
+    assert _status(db, "real") == "active"
+    db.close()
+
+
+def test_relaunch_retires_exited_predecessor(env):
+    db = cli.get_db()
+    _pane_row(db, "old", _exited_pid())
+    _pane_row(db, "new", 99999)
+    cli._retire_pane_predecessors(db, "new", "h", "b", "%7")
+    assert _status(db, "old") == "superseded"
+    db.close()
+
+
+def test_running_placeholder_is_still_retired(env):
+    import os
+    db = cli.get_db()
+    _pane_row(db, "tmux-h-%7-1", os.getpid())
+    _pane_row(db, "real", os.getpid() + 1)
+    cli._retire_pane_predecessors(db, "real", "h", "b", "%7")
+    assert _status(db, "tmux-h-%7-1") == "superseded"
+    db.close()

@@ -981,7 +981,7 @@ def test_retire_pane_predecessors_skips_generic_label():
         "CREATE TABLE sessions ("
         "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
         "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
-        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER, pid INTEGER)"
     )
     db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
     # Predecessor with classified topic
@@ -1039,7 +1039,7 @@ def test_retire_pane_predecessors_inherits_from_paused_row():
         "CREATE TABLE sessions ("
         "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
         "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
-        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER, pid INTEGER)"
     )
     db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
     db.execute(
@@ -1071,7 +1071,7 @@ def test_retire_pane_predecessors_unlocks_placeholder_inheritance():
         "CREATE TABLE sessions ("
         "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
         "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
-        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER, pid INTEGER)"
     )
     db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
     db.execute(
@@ -1129,6 +1129,43 @@ def test_heartbeat_never_drains_a_live_session(monkeypatch, tmp_path):
     db.close()
     assert status["tmux-host1-%33-10"] == "active"
     assert status["idle-dead"] == "paused"
+
+
+def test_heartbeat_dedup_keeps_a_live_peer_sharing_the_pane(monkeypatch, tmp_path):
+    # A hook's headless agent inherits TMUX_PANE, so two running agents can hold
+    # active rows on one pane. Neither is a duplicate of the other.
+    monkeypatch.setattr(cli, "DB_DIR", tmp_path)
+    monkeypatch.setattr(cli, "DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(cli, "_host", lambda: "host1")
+    monkeypatch.setattr(cli, "_boot_id", lambda: "boot1")
+    monkeypatch.setattr(cli, "_live_tmux_panes", lambda: {"%33"})
+    monkeypatch.setattr(cli, "_live_tmux_sessions", lambda: set())
+    monkeypatch.setattr(cli, "_pane_session_names", lambda: {})
+    monkeypatch.setattr(cli, "_live_agent_panes", lambda: {})
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid, boot_id, boot: pid in (10, 11))
+    monkeypatch.setattr(cli, "_reap_dead", lambda db, now: [])
+    for name in dir(cli):
+        if name.startswith("_cloud_"):
+            monkeypatch.setattr(cli, name, lambda *a, **k: None)
+    now = cli.time.time()
+    db = cli.get_db()
+    for uid, pid, seen in (("real", 10, now), ("headless", 11, now - 5), ("tmux-host1-%33-10", 10, now)):
+        db.execute(
+            "INSERT INTO sessions (uid, label, status, last_seen, started_at, last_activity, "
+            "host, tmux_pane, pid, boot_id) VALUES (?, 'work', 'active', ?, ?, ?, 'host1', '%33', ?, 'boot1')",
+            (uid, seen, seen, seen, pid),
+        )
+    db.commit()
+    db.close()
+
+    cli.cmd_heartbeat(cli.argparse.Namespace(tmux_session=None))
+
+    db = cli.get_db()
+    status = dict(db.execute("SELECT uid, status FROM sessions").fetchall())
+    db.close()
+    assert status["real"] == "active"
+    assert status["headless"] == "active"
+    assert status["tmux-host1-%33-10"] != "active"
 
 
 # --- evidence-first signal: repo / branch / touched paths ---------------------
