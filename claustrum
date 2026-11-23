@@ -2874,32 +2874,45 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
 
 
 AGENT_CLIS = {"claude", "codex", "gemini", "agy", "qwen"}
+SHELLS = {"sh", "bash", "zsh", "fish", "dash"}
+# Run-wrappers a session commonly puts in front of a nested run; they don't end the walk.
+WRAPPERS = {"timeout", "gtimeout", "env", "nohup", "time", "nice", "caffeinate", "stdbuf"}
+NESTED_DIR = DB_DIR / "nested"
 
 
-def _agent_argv(args):
-    """The argv of an agent CLI process (claude/codex/...), else None. A node-run
-    install shows as `node /path/claude ...`, so look one token in for those."""
+def _argv(args):
     try:
-        argv = shlex.split(args)
+        return shlex.split(args)
     except ValueError:
-        argv = args.split()
-    for start in (0, 1):
-        if len(argv) > start and os.path.basename(argv[start]) in AGENT_CLIS:
-            if start == 0 or os.path.basename(argv[0]) in ("node", "bun"):
-                return argv[start:]
+        return args.split()
+
+
+def _agent_argv(argv):
+    """The argv from the agent CLI on (claude/codex/...), else None. A node- or
+    bun-run install shows as `node [node flags] /path/claude ...`."""
+    if argv and os.path.basename(argv[0]) in AGENT_CLIS:
+        return argv
+    if argv and os.path.basename(argv[0]) in ("node", "bun"):
+        for i, token in enumerate(argv[1:], 1):
+            if not token.startswith("-"):
+                return argv[i:] if os.path.basename(token) in AGENT_CLIS else None
     return None
 
 
 def _is_headless(argv):
-    return "-p" in argv or "--print" in argv or (os.path.basename(argv[0]) == "codex" and "exec" in argv[1:2])
+    if os.path.basename(argv[0]) == "codex":
+        # Global options (some with values, e.g. `-m o3`) can precede the subcommand.
+        return "exec" in argv[1:6] or argv[1:2] == ["e"]
+    return "--print" in argv or "-p" in argv
 
 
 def _nested_headless(pid=None, table=None):
     """True when the agent running this hook is a headless run (`claude -p`, `codex
-    exec`) started from inside another agent session, e.g. a smoke test a session
-    shells out to. Those inherit the parent's tmux pane and label and would flood the
-    board as look-alike sessions. Conductor's rich sessions are headless too but have
-    no agent ancestor, so they still register."""
+    exec`) that another agent session started through its shell (a Bash tool, or a
+    script that tool ran). Only shells and run-wrappers (timeout, nohup...) may sit
+    between the two: Conductor's rich
+    sessions are headless too, but they hang off tmux or the local-server, so they
+    still register."""
     if table is None:
         try:
             out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True,
@@ -2912,39 +2925,58 @@ def _nested_headless(pid=None, table=None):
             if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
                 table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
     pid = os.getppid() if pid is None else pid
-    own = None
+    own = False
     for _ in range(64):
-        if pid not in table or pid <= 1:
+        if pid <= 1 or pid not in table:
             return False
         ppid, args = table[pid]
-        argv = _agent_argv(args)
-        if argv is not None:
-            if own is None:
-                own = argv
-                if not _is_headless(own):
-                    return False
-            else:
+        argv = _argv(args)
+        agent = _agent_argv(argv)
+        if agent is not None:
+            if own:
                 return True
+            if not _is_headless(agent):
+                return False
+            own = True
+        elif own and (not argv or os.path.basename(argv[0]).lstrip("-") not in SHELLS | WRAPPERS):
+            return False
         pid = ppid
     return False
 
 
+def _registered(uid):
+    if not DB_PATH.exists():
+        return False
+    db = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+    try:
+        return db.execute("SELECT 1 FROM sessions WHERE uid = ?", (uid,)).fetchone() is not None
+    finally:
+        db.close()
+
+
 def _skip_nested_hook(raw):
-    """Hooks of an unregistered nested headless run do nothing. A session already on
-    the board is never re-checked, so this costs one sqlite lookup per hook call."""
+    """Hooks of an unregistered nested headless run do nothing. A registered session is
+    never re-checked, and a nested verdict is remembered per session id, so the
+    process walk runs once per session."""
     if os.environ.get("CLAUSTRUM_NESTED") == "1":
         return False
     try:
-        uid = (json.loads(raw) or {}).get("session_id")
+        uid = str((json.loads(raw) or {}).get("session_id") or "")
     except (ValueError, AttributeError):
         return False
-    if uid:
+    marker = NESTED_DIR / re.sub(r"[^A-Za-z0-9_-]", "", uid) if uid else None
+    if marker and marker.exists():
+        return True
+    if uid and _registered(uid):
+        return False
+    nested = _nested_headless()
+    if nested and marker:
         try:
-            if get_db().execute("SELECT 1 FROM sessions WHERE uid = ?", (uid,)).fetchone():
-                return False
-        except sqlite3.Error:
-            return False
-    return _nested_headless()
+            NESTED_DIR.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError:
+            pass
+    return nested
 
 
 def _ensure_session(db, uid, cwd=None, inherit_classification=True):
@@ -7449,8 +7481,16 @@ def main():
 
     # Dispatch
     if args.command == "hook":
-        raw = "" if os.environ.get("CLAUSTRUM_DISABLED") == "1" else sys.stdin.read()
-        if os.environ.get("CLAUSTRUM_DISABLED") == "1" or _skip_nested_hook(raw):
+        disabled = os.environ.get("CLAUSTRUM_DISABLED") == "1"
+        raw, skip = "", disabled
+        if not disabled:
+            # Fail open, like the handlers: a broken nested check must not eat a prompt.
+            try:
+                raw = sys.stdin.read()
+                skip = _skip_nested_hook(raw)
+            except Exception:
+                skip = False
+        if skip:
             if args.event in ("pre-tool", "post-tool"):
                 print("{}")
             return
