@@ -54,6 +54,15 @@ PostToolUse hook on Edit/Write
        └──→ Broadcast: "I just edited auth/service.ts"
 ```
 
+**Nested headless runs stay off the board.** A `claude -p` (or `codex exec`) that a
+session shells out to, such as a smoke test or a scripted publish, inherits that
+session's tmux pane and label. Before this, each such run appeared as another
+look-alike session. Every hook of an unregistered session first walks the process
+tree (one `ps`). If the agent running it is headless and another agent CLI is an
+ancestor, every hook does nothing. Conductor's rich sessions are headless too, but no
+agent launched them, so they still register. A session that is already on the board
+is never re-checked. Set `CLAUSTRUM_NESTED=1` to register a nested run anyway.
+
 The backing store is a single SQLite file (`~/.claustrum/state.db`) in WAL mode. No daemon. No server. Each session reads and writes directly. SQLite handles the concurrency.
 
 ### Duplicate opening briefs
@@ -641,6 +650,7 @@ Switches:
 |--------|--------|
 | `CLAUSTRUM_PRIVATE=1` | All cloud writes/reads short-circuit. Loud banner printed once to stderr. |
 | `CLAUSTRUM_PUBLIC=1` | Overrides `CLAUSTRUM_PRIVATE` (escape hatch when the LLM is too cautious). |
+| `CLAUSTRUM_NESTED=1` | Register a headless run even when another agent session started it (nested runs are skipped by default). |
 | `claustrum checkin --private` | Same effect as `CLAUSTRUM_PRIVATE`, scoped to one invocation. |
 | `CLAUSTRUM_SOCKET_PUSH=1` | Enable the experimental Claude Code messaging-socket fast-path for directed messages (wakes idle sessions). Off by default; failures are swallowed and the `messages` row is always written regardless. See [Message delivery](#message-delivery-agent-agnostic-with-a-claude-code-fast-path). |
 

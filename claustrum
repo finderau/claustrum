@@ -25,6 +25,7 @@ import datetime as _dt
 import functools
 import hashlib
 import inspect
+import io
 import json
 import os
 import re
@@ -2870,6 +2871,80 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
     for p in preds:
         db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
         db.execute("DELETE FROM claims WHERE uid = ?", (p["uid"],))
+
+
+AGENT_CLIS = {"claude", "codex", "gemini", "agy", "qwen"}
+
+
+def _agent_argv(args):
+    """The argv of an agent CLI process (claude/codex/...), else None. A node-run
+    install shows as `node /path/claude ...`, so look one token in for those."""
+    try:
+        argv = shlex.split(args)
+    except ValueError:
+        argv = args.split()
+    for start in (0, 1):
+        if len(argv) > start and os.path.basename(argv[start]) in AGENT_CLIS:
+            if start == 0 or os.path.basename(argv[0]) in ("node", "bun"):
+                return argv[start:]
+    return None
+
+
+def _is_headless(argv):
+    return "-p" in argv or "--print" in argv or (os.path.basename(argv[0]) == "codex" and "exec" in argv[1:2])
+
+
+def _nested_headless(pid=None, table=None):
+    """True when the agent running this hook is a headless run (`claude -p`, `codex
+    exec`) started from inside another agent session, e.g. a smoke test a session
+    shells out to. Those inherit the parent's tmux pane and label and would flood the
+    board as look-alike sessions. Conductor's rich sessions are headless too but have
+    no agent ancestor, so they still register."""
+    if table is None:
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True,
+                                 text=True, timeout=2).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        table = {}
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    pid = os.getppid() if pid is None else pid
+    own = None
+    for _ in range(64):
+        if pid not in table or pid <= 1:
+            return False
+        ppid, args = table[pid]
+        argv = _agent_argv(args)
+        if argv is not None:
+            if own is None:
+                own = argv
+                if not _is_headless(own):
+                    return False
+            else:
+                return True
+        pid = ppid
+    return False
+
+
+def _skip_nested_hook(raw):
+    """Hooks of an unregistered nested headless run do nothing. A session already on
+    the board is never re-checked, so this costs one sqlite lookup per hook call."""
+    if os.environ.get("CLAUSTRUM_NESTED") == "1":
+        return False
+    try:
+        uid = (json.loads(raw) or {}).get("session_id")
+    except (ValueError, AttributeError):
+        return False
+    if uid:
+        try:
+            if get_db().execute("SELECT 1 FROM sessions WHERE uid = ?", (uid,)).fetchone():
+                return False
+        except sqlite3.Error:
+            return False
+    return _nested_headless()
 
 
 def _ensure_session(db, uid, cwd=None, inherit_classification=True):
@@ -7374,10 +7449,12 @@ def main():
 
     # Dispatch
     if args.command == "hook":
-        if os.environ.get("CLAUSTRUM_DISABLED") == "1":
+        raw = "" if os.environ.get("CLAUSTRUM_DISABLED") == "1" else sys.stdin.read()
+        if os.environ.get("CLAUSTRUM_DISABLED") == "1" or _skip_nested_hook(raw):
             if args.event in ("pre-tool", "post-tool"):
                 print("{}")
             return
+        sys.stdin = io.StringIO(raw)
         hook_handlers = {
             "prompt": hook_prompt,
             "pre-tool": hook_pre_tool,
