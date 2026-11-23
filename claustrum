@@ -25,6 +25,7 @@ import datetime as _dt
 import functools
 import hashlib
 import inspect
+import io
 import json
 import os
 import re
@@ -2870,6 +2871,128 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
     for p in preds:
         db.execute("UPDATE sessions SET status = 'superseded' WHERE uid = ?", (p["uid"],))
         db.execute("DELETE FROM claims WHERE uid = ?", (p["uid"],))
+
+
+AGENT_CLIS = {"claude", "codex", "gemini", "agy", "qwen"}
+SHELLS = {"sh", "bash", "zsh", "fish", "dash"}
+# Run-wrappers a session commonly puts in front of a nested run; they don't end the walk.
+WRAPPERS = {"timeout", "gtimeout", "env", "nohup", "time", "nice", "caffeinate", "stdbuf"}
+NESTED_DIR = DB_DIR / "nested"
+
+
+def _argv(args):
+    try:
+        return shlex.split(args)
+    except ValueError:
+        return args.split()
+
+
+def _agent_argv(argv):
+    """The argv from the agent CLI on (claude/codex/...), else None. A node- or
+    bun-run install shows as `node [node flags] /path/claude ...`."""
+    if argv and os.path.basename(argv[0]) in AGENT_CLIS:
+        return argv
+    if argv and os.path.basename(argv[0]) in ("node", "bun"):
+        for i, token in enumerate(argv[1:], 1):
+            if not token.startswith("-"):
+                return argv[i:] if os.path.basename(token) in AGENT_CLIS else None
+    return None
+
+
+CODEX_VALUE_OPTS = {"-c", "--config", "-i", "--image", "-m", "--model", "-p", "--profile",
+                    "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd", "--add-dir",
+                    "--local-provider", "--enable", "--disable"}
+
+
+def _codex_subcommand(argv):
+    args = iter(argv[1:])
+    for token in args:
+        if token == "--":
+            return None
+        if token in CODEX_VALUE_OPTS:
+            next(args, None)
+        elif not token.startswith("-"):
+            return token
+    return None
+
+
+def _is_headless(argv):
+    if os.path.basename(argv[0]) == "codex":
+        return _codex_subcommand(argv) in ("exec", "e")
+    return "--print" in argv or "-p" in argv
+
+
+def _nested_headless(pid=None, table=None):
+    """True when the agent running this hook is a headless run (`claude -p`, `codex
+    exec`) that another agent session started through its shell (a Bash tool, or a
+    script that tool ran). Only shells and run-wrappers (timeout, nohup...) may sit
+    between the two: Conductor's rich
+    sessions are headless too, but they hang off tmux or the local-server, so they
+    still register."""
+    if table is None:
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,args="], capture_output=True,
+                                 text=True, timeout=2).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        table = {}
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    pid = os.getppid() if pid is None else pid
+    own = False
+    for _ in range(64):
+        if pid <= 1 or pid not in table:
+            return False
+        ppid, args = table[pid]
+        argv = _argv(args)
+        agent = _agent_argv(argv)
+        if agent is not None:
+            if own:
+                return True
+            if not _is_headless(agent):
+                return False
+            own = True
+        elif own and (not argv or os.path.basename(argv[0]).lstrip("-") not in SHELLS | WRAPPERS):
+            return False
+        pid = ppid
+    return False
+
+
+def _registered(uid):
+    if not DB_PATH.exists():
+        return False
+    db = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+    try:
+        return db.execute("SELECT 1 FROM sessions WHERE uid = ?", (uid,)).fetchone() is not None
+    finally:
+        db.close()
+
+
+def _skip_nested_hook(raw):
+    """Hooks of an unregistered nested headless run do nothing. A registered session is
+    never re-checked, and a nested verdict is remembered per session id, so the
+    process walk runs once per session."""
+    if os.environ.get("CLAUSTRUM_NESTED") == "1":
+        return False
+    try:
+        uid = str((json.loads(raw) or {}).get("session_id") or "")
+    except (ValueError, AttributeError):
+        return False
+    marker = NESTED_DIR / re.sub(r"[^A-Za-z0-9_-]", "", uid) if uid else None
+    if uid and _registered(uid):
+        return False
+    if marker and marker.exists():
+        return True
+    nested = _nested_headless()
+    if nested and marker:
+        try:
+            NESTED_DIR.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        except OSError:
+            pass
+    return nested
 
 
 def _ensure_session(db, uid, cwd=None, inherit_classification=True):
@@ -7374,10 +7497,20 @@ def main():
 
     # Dispatch
     if args.command == "hook":
-        if os.environ.get("CLAUSTRUM_DISABLED") == "1":
+        disabled = os.environ.get("CLAUSTRUM_DISABLED") == "1"
+        raw, skip = "", disabled
+        if not disabled:
+            # Fail open, like the handlers: a broken nested check must not eat a prompt.
+            try:
+                raw = sys.stdin.read()
+                skip = _skip_nested_hook(raw)
+            except Exception:
+                skip = False
+        if skip:
             if args.event in ("pre-tool", "post-tool"):
                 print("{}")
             return
+        sys.stdin = io.StringIO(raw)
         hook_handlers = {
             "prompt": hook_prompt,
             "pre-tool": hook_pre_tool,
