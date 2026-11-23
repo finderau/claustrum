@@ -63,6 +63,10 @@ def test_codex_profile_flag_is_not_headless_but_exec_after_options_is():
     assert claustrum._is_headless(["codex", "-p", "work"]) is False
     assert claustrum._is_headless(["codex", "-m", "o3", "exec", "go"]) is True
     assert claustrum._is_headless(["codex", "--full-auto", "exec", "go"]) is True
+    assert claustrum._is_headless(["codex", "-p", "exec"]) is False
+    assert claustrum._is_headless(
+        ["codex", "-m", "o3", "-p", "work", "--full-auto", "exec", "go"]) is True
+    assert claustrum._is_headless(["codex", "e", "go"]) is True
 
 
 def test_node_flags_before_the_script_are_skipped():
@@ -110,3 +114,19 @@ def test_a_registered_session_is_never_skipped_and_verdicts_are_remembered(tmp_p
     assert len(calls) == 1, "the process walk runs once per nested session"
     monkeypatch.setenv("CLAUSTRUM_NESTED", "1")
     assert claustrum._skip_nested_hook('{"session_id": "other-child"}') is False
+
+
+def test_registration_after_a_nested_verdict_wins(tmp_path, monkeypatch):
+    monkeypatch.setattr(claustrum, "_nested_headless", lambda *a, **k: True)
+    db_path = tmp_path / "state.db"
+    db = claustrum.sqlite3.connect(db_path)
+    db.execute("CREATE TABLE sessions (uid TEXT)")
+    db.commit()
+    monkeypatch.setattr(claustrum, "DB_PATH", db_path)
+    monkeypatch.setattr(claustrum, "NESTED_DIR", tmp_path / "nested")
+    monkeypatch.delenv("CLAUSTRUM_NESTED", raising=False)
+    assert claustrum._skip_nested_hook('{"session_id": "late"}') is True
+    db.execute("INSERT INTO sessions VALUES ('late')")
+    db.commit()
+    db.close()
+    assert claustrum._skip_nested_hook('{"session_id": "late"}') is False

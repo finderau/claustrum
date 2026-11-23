@@ -58,9 +58,10 @@ PostToolUse hook on Edit/Write
 session shells out to, such as a smoke test or a scripted publish, inherits that
 session's tmux pane and label. Before this, each such run appeared as another
 look-alike session. Every hook of an unregistered session first walks the process
-tree (one `ps`). If the agent running it is headless and another agent CLI is an
-ancestor, every hook does nothing. Conductor's rich sessions are headless too, but no
-agent launched them, so they still register. A session that is already on the board
+tree (one `ps`). If the agent running it is headless and another agent CLI is reached
+from it through only shells and run-wrappers (`timeout`, `nohup`, `env`...), every
+hook does nothing. Any other launcher in between (tmux, the local-server) ends the
+walk, so Conductor's rich sessions, headless too, still register. A session that is already on the board
 is never re-checked. Set `CLAUSTRUM_NESTED=1` to register a nested run anyway.
 
 The backing store is a single SQLite file (`~/.claustrum/state.db`) in WAL mode. No daemon. No server. Each session reads and writes directly. SQLite handles the concurrency.

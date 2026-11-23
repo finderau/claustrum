@@ -2899,10 +2899,24 @@ def _agent_argv(argv):
     return None
 
 
+CODEX_VALUE_OPTS = {"-c", "--config", "-i", "--image", "-m", "--model", "-p", "--profile",
+                    "-s", "--sandbox", "-a", "--ask-for-approval", "-C", "--cd", "--add-dir",
+                    "--local-provider", "--enable", "--disable"}
+
+
+def _codex_subcommand(argv):
+    args = iter(argv[1:])
+    for token in args:
+        if token in CODEX_VALUE_OPTS:
+            next(args, None)
+        elif not token.startswith("-"):
+            return token
+    return None
+
+
 def _is_headless(argv):
     if os.path.basename(argv[0]) == "codex":
-        # Global options (some with values, e.g. `-m o3`) can precede the subcommand.
-        return "exec" in argv[1:6] or argv[1:2] == ["e"]
+        return _codex_subcommand(argv) in ("exec", "e")
     return "--print" in argv or "-p" in argv
 
 
@@ -2965,10 +2979,10 @@ def _skip_nested_hook(raw):
     except (ValueError, AttributeError):
         return False
     marker = NESTED_DIR / re.sub(r"[^A-Za-z0-9_-]", "", uid) if uid else None
-    if marker and marker.exists():
-        return True
     if uid and _registered(uid):
         return False
+    if marker and marker.exists():
+        return True
     nested = _nested_headless()
     if nested and marker:
         try:
