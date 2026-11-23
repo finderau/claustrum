@@ -981,7 +981,7 @@ def test_retire_pane_predecessors_skips_generic_label():
         "CREATE TABLE sessions ("
         "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
         "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
-        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER, pid INTEGER)"
     )
     db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
     # Predecessor with classified topic
@@ -1039,7 +1039,7 @@ def test_retire_pane_predecessors_inherits_from_paused_row():
         "CREATE TABLE sessions ("
         "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
         "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
-        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER, pid INTEGER)"
     )
     db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
     db.execute(
@@ -1071,7 +1071,7 @@ def test_retire_pane_predecessors_unlocks_placeholder_inheritance():
         "CREATE TABLE sessions ("
         "uid TEXT PRIMARY KEY, label TEXT, domain TEXT, topic TEXT, "
         "topic_confidence REAL, status TEXT, last_seen REAL, end_reason TEXT, "
-        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER)"
+        "tmux_pane TEXT, host TEXT, boot_id TEXT, classify_locked INTEGER, pid INTEGER)"
     )
     db.execute("CREATE TABLE claims (uid TEXT, path TEXT)")
     db.execute(

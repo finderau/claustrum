@@ -2767,6 +2767,18 @@ def _refine_auto_name(uid):
     return new_name
 
 
+def _is_live_peer(pred, my_pid, boot):
+    """True for another agent's active row whose recorded process is still running.
+    Placeholders (`tmux-…`) stand in for whatever runs in the pane, so they are
+    always replaceable."""
+    if pred["uid"].startswith("tmux-") or pred["status"] != "active":
+        return False
+    pid = pred["pid"]
+    if not pid or pid == my_pid:
+        return False
+    return _pid_alive(pid, boot, boot)
+
+
 def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=True):
     """Retire any OTHER session rows that share this session's tmux pane on the
     same machine and boot — the predecessors left behind when Claude is
@@ -2793,12 +2805,20 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
     if not (pane and host and boot):
         return
     preds = db.execute(
-        "SELECT uid, label, domain, topic, topic_confidence, end_reason, classify_locked FROM sessions "
+        "SELECT uid, label, domain, topic, topic_confidence, end_reason, classify_locked, "
+        "status, pid FROM sessions "
         "WHERE tmux_pane = ? AND host = ? AND boot_id = ? AND uid != ? "
         "AND status IN ('active', 'stale', 'done', 'paused') "
         "ORDER BY last_seen DESC",
         (pane, host, boot, uid),
     ).fetchall()
+    # A relaunch means the pane's previous agent has exited. An active agent whose
+    # process is still running is a concurrent session sharing the pane's environment
+    # (a hook's headless `claude -p` inherits TMUX_PANE), not a predecessor: retiring it
+    # would hide the live session and move its board tile to the newcomer's collection.
+    me = db.execute("SELECT pid FROM sessions WHERE uid = ?", (uid,)).fetchone()
+    my_pid = me["pid"] if me else None
+    preds = [p for p in preds if not _is_live_peer(p, my_pid, boot)]
     # Carry the most-recent predecessor's classification forward onto the new
     # lineage, filling only fields the new row still lacks — but ONLY when it's the
     # SAME task relaunching in this pane (labels match once status glyphs are
