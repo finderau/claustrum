@@ -67,6 +67,7 @@ def test_codex_profile_flag_is_not_headless_but_exec_after_options_is():
     assert claustrum._is_headless(
         ["codex", "-m", "o3", "-p", "work", "--full-auto", "exec", "go"]) is True
     assert claustrum._is_headless(["codex", "e", "go"]) is True
+    assert claustrum._is_headless(["codex", "--", "exec"]) is False
 
 
 def test_node_flags_before_the_script_are_skipped():

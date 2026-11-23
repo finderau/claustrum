@@ -2907,6 +2907,8 @@ CODEX_VALUE_OPTS = {"-c", "--config", "-i", "--image", "-m", "--model", "-p", "-
 def _codex_subcommand(argv):
     args = iter(argv[1:])
     for token in args:
+        if token == "--":
+            return None
         if token in CODEX_VALUE_OPTS:
             next(args, None)
         elif not token.startswith("-"):
