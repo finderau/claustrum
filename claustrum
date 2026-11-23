@@ -2776,7 +2776,7 @@ def _is_live_peer(pred, my_pid, boot):
     pid = pred["pid"]
     if not pid or pid == my_pid:
         return False
-    return _pid_alive(pid, boot, boot)
+    return _pid_alive(pid, pred["boot_id"], boot)
 
 
 def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=True):
@@ -2806,7 +2806,7 @@ def _retire_pane_predecessors(db, uid, host, boot, pane, inherit_classification=
         return
     preds = db.execute(
         "SELECT uid, label, domain, topic, topic_confidence, end_reason, classify_locked, "
-        "status, pid FROM sessions "
+        "status, pid, boot_id FROM sessions "
         "WHERE tmux_pane = ? AND host = ? AND boot_id = ? AND uid != ? "
         "AND status IN ('active', 'stale', 'done', 'paused') "
         "ORDER BY last_seen DESC",
@@ -5772,11 +5772,12 @@ def cmd_heartbeat(args):
     # DEDUP to one active row per pane (full run): a reused pane, or a
     # placeholder adopted above plus the real hook row, both go active. Keep one
     # — prefer a real (hook) uid over a 'tmux-' placeholder, else the most
-    # recently seen — and reap the rest so each pane shows once.
+    # recently seen — and reap the rest so each pane shows once. A live peer
+    # (another agent's running process sharing the pane) is not a duplicate.
     if not target:
         by_pane = {}
         for r2 in db.execute(
-            "SELECT uid, tmux_pane, last_seen FROM sessions "
+            "SELECT uid, tmux_pane, last_seen, status, pid, boot_id, host FROM sessions "
             "WHERE status = 'active' AND tmux_pane IS NOT NULL"
         ).fetchall():
             by_pane.setdefault(r2["tmux_pane"], []).append(r2)
@@ -5787,7 +5788,10 @@ def cmd_heartbeat(args):
                 1 if str(r2["uid"]).startswith("tmux-") else 0,
                 -(r2["last_seen"] or 0),
             ))
+            keeper = group[0]
             for r2 in group[1:]:
+                if r2["host"] == host and _is_live_peer(r2, keeper["pid"], boot):
+                    continue
                 db.execute("UPDATE sessions SET status = 'dead' WHERE uid = ?", (r2["uid"],))
                 db.execute("DELETE FROM claims WHERE uid = ?", (r2["uid"],))
                 dups.append(r2["uid"])
